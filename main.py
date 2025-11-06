@@ -69,6 +69,21 @@ def column_index_to_letter(idx: int) -> str:
     return letters
 
 
+def last_float(series: pd.Series) -> float:
+    """Return last numeric value as float or np.nan if missing/non-finite."""
+    if series is None or len(series) == 0:
+        return np.nan
+    val = series.iloc[-1]
+    # Pandas-aware NA check
+    if pd.isna(val):
+        return np.nan
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else np.nan
+    except Exception:
+        return np.nan
+
+
 def sheets_update_with_backoff(ws, *, values, range_name, value_input_option="RAW", max_retries=5):
     """Wrapper around worksheet.update with exponential backoff on 429."""
     delay = BACKOFF_BASE
@@ -248,9 +263,9 @@ def compute_pl(df: pd.DataFrame, days: int) -> float:
     if len(end) <= bars_back:
         return np.nan
     start_price = end.iloc[-1 - bars_back]
-    if start_price == 0 or np.isnan(start_price):
+    if start_price == 0 or pd.isna(start_price):
         return np.nan
-    return (end_price - start_price) / start_price * 100.0
+    return (float(end_price) - float(start_price)) / float(start_price) * 100.0
 
 
 def fetch_ath(exchange: ccxt.Exchange, symbol: str) -> float:
@@ -332,7 +347,6 @@ def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_
     """Write a contiguous block of summary rows for a batch of symbols in one request."""
     if not symbol_order:
         return
-    # Build summary rows, one per symbol
     rows = []
     for i, sym in enumerate(symbol_order):
         col_idx = start_col_idx + i
@@ -387,8 +401,6 @@ def process_once(exchange: ccxt.Exchange, sh):
     since_dt = datetime.now(timezone.utc) - timedelta(minutes=15 * need_bars)
     since_ms = int(since_dt.timestamp() * 1000)
 
-    # We maintain stable positions: column index for a symbol is 1 + its index in `symbols`
-    # Summary row index for a symbol is 2 + its index in `symbols`
     for chunk_start in range(0, len(symbols), BATCH_SIZE):
         chunk_syms = symbols[chunk_start:chunk_start + BATCH_SIZE]
         start_col_idx = 1 + chunk_start
@@ -403,7 +415,6 @@ def process_once(exchange: ccxt.Exchange, sh):
             df15 = to_df(ohlcv15)
             if df15.empty:
                 logger.warning(f"No 15m data for {sym}")
-                # fill with blanks to keep alignment
                 closes_by_symbol[sym] = []
                 metrics_by_symbol[sym] = {
                     "last_price": "",
@@ -425,21 +436,21 @@ def process_once(exchange: ccxt.Exchange, sh):
             closes = df15["close"].dropna().iloc[-SPARKLINE_BARS:]
             closes_by_symbol[sym] = [float(x) for x in closes.tolist()]
 
-            last_price = float(df15["close"].iloc[-1])
+            last_price = last_float(df15["close"])
             pl1d = compute_pl(df15, 1)
             pl7d = compute_pl(df15, 7)
             pl14d = compute_pl(df15, 14)
             vol24h = fetch_24h_volume(exchange, sym, df15)
 
             ath = fetch_ath(exchange, sym)
-            pct_down_ath = float((last_price - ath) / ath * 100.0) if ath and ath > 0 else np.nan
+            pct_down_ath = ((last_price - ath) / ath * 100.0) if (ath and ath > 0 and math.isfinite(last_price)) else np.nan
 
-            rsi14 = float(df15["RSI14"].iloc[-1]) if not np.isnan(df15["RSI14"].iloc[-1]) else np.nan
-            sma240 = float(df15["SMA240"].iloc[-1]) if not np.isnan(df15["SMA240"].iloc[-1]) else np.nan
-            sma720 = float(df15["SMA720"].iloc[-1]) if not np.isnan(df15["SMA720"].iloc[-1]) else np.nan
-            macd = float(df15["MACD"].iloc[-1]) if not np.isnan(df15["MACD"].iloc[-1]) else np.nan
-            macd_signal = float(df15["MACD_signal"].iloc[-1]) if not np.isnan(df15["MACD_signal"].iloc[-1]) else np.nan
-            macd_hist = float(df15["MACD_hist"].iloc[-1]) if not np.isnan(df15["MACD_hist"].iloc[-1]) else np.nan
+            rsi14 = last_float(df15["RSI14"])
+            sma240 = last_float(df15["SMA240"])
+            sma720 = last_float(df15["SMA720"])
+            macd = last_float(df15["MACD"])
+            macd_signal = last_float(df15["MACD_signal"])
+            macd_hist = last_float(df15["MACD_hist"])
 
             metrics_by_symbol[sym] = {
                 "last_price": last_price,
