@@ -74,7 +74,6 @@ def last_float(series: pd.Series) -> float:
     if series is None or len(series) == 0:
         return np.nan
     val = series.iloc[-1]
-    # Pandas-aware NA check
     if pd.isna(val):
         return np.nan
     try:
@@ -135,26 +134,23 @@ def get_or_create_worksheet(sh, title, rows=2000, cols=50):
 
 
 def ensure_headers(ws):
+    # Only write A1:M1; do NOT clear, so columns N+ remain untouched
     headers = [
-        "Symbol",
-        "Last Price",
-        "% Down from ATH",
-        "PL% 1D",
-        "PL% 7D",
-        "PL% 14D",
-        "24h Volume",
-        "RSI14",
-        "SMA240",
-        "SMA720",
-        "MACD",
-        "MACD Signal",
-        "MACD Hist",
-        "Sparkline",
+        "Symbol",           # A
+        "Last Price",       # B
+        "% Down from ATH",  # C
+        "PL% 1D",           # D
+        "PL% 7D",           # E
+        "24h Volume",       # F
+        "RSI14",            # G
+        "SMA240",           # H
+        "SMA720",           # I
+        "MACD",             # J
+        "MACD Signal",      # K
+        "MACD Hist",        # L
+        "Sparkline",        # M
     ]
-    existing = ws.row_values(1)
-    if existing != headers:
-        ws.clear()
-        sheets_update_with_backoff(ws, values=[headers], range_name="A1:N1", value_input_option="USER_ENTERED")
+    sheets_update_with_backoff(ws, values=[headers], range_name="A1:M1", value_input_option="USER_ENTERED")
 
 
 # ----------------------------
@@ -344,7 +340,8 @@ def write_chart_block(ws_chart, start_col_idx: int, closes_by_symbol: Dict[str, 
 
 
 def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_by_symbol: Dict[str, Dict[str, Any]], symbol_order: List[str]):
-    """Write a contiguous block of summary rows for a batch of symbols in one request."""
+    """Write a contiguous block of summary rows for a batch of symbols in one request.
+    Only updates A..M (does not touch N+)."""
     if not symbol_order:
         return
     rows = []
@@ -354,21 +351,24 @@ def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_
         spark_formula = f"=SPARKLINE('{CHART_SHEET}'!{col_letter}2:{col_letter}{SPARKLINE_BARS+1})"
 
         m = metrics_by_symbol[sym]
+
+        # Clean display: drop '/USD' in column A
+        base_sym = sym.split('/')[0]
+
         row = [
-            sym,
-            m.get("last_price"),
-            m.get("pct_down_from_ath"),
-            m.get("pl1d"),
-            m.get("pl7d"),
-            m.get("pl14d"),
-            m.get("vol24h"),
-            m.get("rsi14"),
-            m.get("sma240"),
-            m.get("sma720"),
-            m.get("macd"),
-            m.get("macd_signal"),
-            m.get("macd_hist"),
-            spark_formula,
+            base_sym,                  # A
+            m.get("last_price"),       # B
+            m.get("pct_down_from_ath"),# C
+            m.get("pl1d"),             # D
+            m.get("pl7d"),             # E
+            m.get("vol24h"),           # F
+            m.get("rsi14"),            # G
+            m.get("sma240"),           # H
+            m.get("sma720"),           # I
+            m.get("macd"),             # J
+            m.get("macd_signal"),      # K
+            m.get("macd_hist"),        # L
+            spark_formula,             # M
         ]
         rows.append(sanitize_row(row))
 
@@ -376,7 +376,7 @@ def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_
     sheets_update_with_backoff(
         ws_sum,
         values=rows,
-        range_name=f"A{start_row_idx}:N{end_row_idx}",
+        range_name=f"A{start_row_idx}:M{end_row_idx}",
         value_input_option="USER_ENTERED",
     )
 
@@ -387,7 +387,7 @@ def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_
 def process_once(exchange: ccxt.Exchange, sh):
     ws_sum = get_or_create_worksheet(sh, SUMMARY_SHEET, rows=6000, cols=100)
     ws_chart = get_or_create_worksheet(sh, CHART_SHEET, rows=SPARKLINE_BARS + 10, cols=3000)
-    ensure_headers(ws_sum)
+    ensure_headers(ws_sum)  # only writes A1:M1
 
     symbols = usd_markets(exchange)
     logger.info(f"Found {len(symbols)} Kraken USD spot markets")
@@ -421,7 +421,6 @@ def process_once(exchange: ccxt.Exchange, sh):
                     "pct_down_from_ath": "",
                     "pl1d": "",
                     "pl7d": "",
-                    "pl14d": "",
                     "vol24h": "",
                     "rsi14": "",
                     "sma240": "",
@@ -439,7 +438,6 @@ def process_once(exchange: ccxt.Exchange, sh):
             last_price = last_float(df15["close"])
             pl1d = compute_pl(df15, 1)
             pl7d = compute_pl(df15, 7)
-            pl14d = compute_pl(df15, 14)
             vol24h = fetch_24h_volume(exchange, sym, df15)
 
             ath = fetch_ath(exchange, sym)
@@ -457,7 +455,6 @@ def process_once(exchange: ccxt.Exchange, sh):
                 "pct_down_from_ath": pct_down_ath,
                 "pl1d": pl1d,
                 "pl7d": pl7d,
-                "pl14d": pl14d,
                 "vol24h": vol24h,
                 "rsi14": rsi14,
                 "sma240": sma240,
@@ -473,7 +470,7 @@ def process_once(exchange: ccxt.Exchange, sh):
         # Write chart block for this batch
         write_chart_block(ws_chart, start_col_idx, closes_by_symbol, chunk_syms)
 
-        # Write summary rows for this batch
+        # Write summary rows (A..M) for this batch
         write_summary_block(ws_sum, start_row_idx, start_col_idx, metrics_by_symbol, chunk_syms)
 
         # Small pause between batches to avoid per-minute caps
