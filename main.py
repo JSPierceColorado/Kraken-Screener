@@ -1,9 +1,11 @@
 import os
 import json
 import time
+import math
+from typing import Any, Iterable, List
 from datetime import datetime, timedelta, timezone
-from dateutil.relativedelta import relativedelta
 
+from dateutil.relativedelta import relativedelta
 import ccxt
 import pandas as pd
 import numpy as np
@@ -15,19 +17,56 @@ from loguru import logger
 SUMMARY_SHEET = "Kraken-Screener"
 CHART_SHEET = "Kraken-Screener-chartData"
 
+# 14 days of 15m bars = 14 * 24 * 4 = 1344
 SPARKLINE_DAYS = 14
 TF = "15m"
 SPARKLINE_BARS = SPARKLINE_DAYS * 24 * 4
 
+# Indicator windows
 RSI_LEN = 14
 SMA_240 = 240
 SMA_720 = 720
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
+# Kraken pagination safety
 FETCH_LIMIT = 500
 
 
+# ----------------------------
+# Utilities / sanitizers
+# ----------------------------
+def sanitize_value(v: Any) -> Any:
+    """Convert NaN/Inf to '', numpy scalars to python scalars.
+    Keep strings (including formulas) as-is so Sheets can parse them."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (np.floating, np.integer)):
+        v = v.item()
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return v if math.isfinite(v) else ""
+    return v
+
+
+def sanitize_row(row: Iterable[Any]) -> list:
+    return [sanitize_value(x) for x in row]
+
+
+def column_index_to_letter(idx: int) -> str:
+    # 1-based index to Excel/Sheets column letter
+    letters = ""
+    while idx > 0:
+        idx, remainder = divmod(idx - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+# ----------------------------
+# Sheets setup
+# ----------------------------
 def load_sheets_client():
     creds_json = os.getenv("GOOGLE_CREDS_JSON")
     if not creds_json:
@@ -35,7 +74,7 @@ def load_sheets_client():
     info = json.loads(creds_json)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
     ]
     credentials = Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(credentials)
@@ -58,39 +97,62 @@ def get_or_create_worksheet(sh, title, rows=2000, cols=50):
     return ws
 
 
-def column_index_to_letter(idx: int) -> str:
-    letters = ''
-    while idx > 0:
-        idx, remainder = divmod(idx - 1, 26)
-        letters = chr(65 + remainder) + letters
-    return letters
+def ensure_headers(ws):
+    headers = [
+        "Symbol",
+        "Last Price",
+        "% Down from ATH",
+        "PL% 1D",
+        "PL% 7D",
+        "PL% 14D",
+        "24h Volume",
+        "RSI14",
+        "SMA240",
+        "SMA720",
+        "MACD",
+        "MACD Signal",
+        "MACD Hist",
+        "Sparkline",
+    ]
+    existing = ws.row_values(1)
+    if existing != headers:
+        ws.clear()
+        # Use new (values-first) signature & USER_ENTERED for nicer formatting
+        ws.update(values=[headers], range_name="A1:N1", value_input_option="USER_ENTERED")
 
 
+# ----------------------------
+# Exchange helpers
+# ----------------------------
 def make_exchange():
     api_key = os.getenv("KRAKEN_API_KEY")
     secret = os.getenv("KRAKEN_API_SECRET")
-    exchange = ccxt.kraken({
-        "enableRateLimit": True,
-        "rateLimit": 1000,
-        "apiKey": api_key,
-        "secret": secret,
-        "options": {"adjustForTimeDifference": True},
-    })
+    exchange = ccxt.kraken(
+        {
+            "enableRateLimit": True,
+            "rateLimit": 1000,
+            "apiKey": api_key,
+            "secret": secret,
+            "options": {"adjustForTimeDifference": True},
+        }
+    )
     exchange.load_markets()
     return exchange
 
 
-def usd_markets(exchange: ccxt.Exchange) -> list[str]:
+def usd_markets(exchange: ccxt.Exchange) -> List[str]:
     syms = []
     for mkt in exchange.markets.values():
         if not mkt.get("active", True):
             continue
         if mkt.get("spot", True) and mkt.get("quote") == "USD":
-            syms.append(mkt["symbol"])
+            syms.append(mkt["symbol"])  # e.g., 'BTC/USD'
     return sorted(set(syms))
 
 
-def fetch_ohlcv_all(exchange: ccxt.Exchange, symbol: str, timeframe: str, since_ms: int, limit: int = FETCH_LIMIT) -> list:
+def fetch_ohlcv_all(
+    exchange: ccxt.Exchange, symbol: str, timeframe: str, since_ms: int, limit: int = FETCH_LIMIT
+) -> list:
     all_rows = []
     since = since_ms
     while True:
@@ -106,25 +168,32 @@ def fetch_ohlcv_all(exchange: ccxt.Exchange, symbol: str, timeframe: str, since_
         if not batch:
             break
         all_rows.extend(batch)
+        # Next page
         new_since = batch[-1][0] + 1
         if new_since <= since:
             break
         since = new_since
         time.sleep(exchange.rateLimit / 1000)
-        if len(all_rows) > 100000:
+        if len(all_rows) > 100000:  # hard cap
             break
     return all_rows
 
 
 def to_df(ohlcv: list) -> pd.DataFrame:
     if not ohlcv:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]).set_index(pd.Index([], name="timestamp"))
+        return (
+            pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            .set_index(pd.Index([], name="timestamp"))
+        )
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
     return df
 
 
+# ----------------------------
+# Indicators & metrics
+# ----------------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -192,24 +261,22 @@ def fetch_24h_volume(exchange: ccxt.Exchange, symbol: str, df15: pd.DataFrame) -
         return np.nan
 
 
-def ensure_headers(ws):
-    headers = [
-        "Symbol", "Last Price", "% Down from ATH", "PL% 1D", "PL% 7D", "PL% 14D",
-        "24h Volume", "RSI14", "SMA240", "SMA720", "MACD", "MACD Signal", "MACD Hist", "Sparkline"
-    ]
-    existing = ws.row_values(1)
-    if existing != headers:
-        ws.clear()
-        ws.update([headers])
-
-
+# ----------------------------
+# Sheet writers
+# ----------------------------
 def write_chart_column(ws_chart, col_idx: int, symbol: str, closes: pd.Series):
+    """Writes the column for the symbol in chart sheet.
+    We keep numbers raw (no NaN because closes is dropna())."""
     col_letter = column_index_to_letter(col_idx)
     ws_chart.update_cell(1, col_idx, symbol)
     if closes is None or closes.empty:
         return
     values = [[float(x)] for x in closes.tolist()]
-    ws_chart.update(f"{col_letter}2:{col_letter}{len(values)+1}", values)
+    ws_chart.update(
+        values=values,
+        range_name=f"{col_letter}2:{col_letter}{len(values)+1}",
+        value_input_option="RAW",
+    )
 
 
 def write_summary_row(ws_sum, row_idx: int, symbol: str, metrics: dict, spark_col_idx: int, nrows_chart: int):
@@ -232,9 +299,17 @@ def write_summary_row(ws_sum, row_idx: int, symbol: str, metrics: dict, spark_co
         metrics.get("macd_hist"),
         spark_formula,
     ]
-    ws_sum.update(f"A{row_idx}:N{row_idx}", [row])
+    clean = sanitize_row(row)
+    ws_sum.update(
+        values=[clean],
+        range_name=f"A{row_idx}:N{row_idx}",
+        value_input_option="USER_ENTERED",  # needed so sparkline formula is parsed
+    )
 
 
+# ----------------------------
+# Main loop
+# ----------------------------
 def process_once(exchange: ccxt.Exchange, sh):
     ws_sum = get_or_create_worksheet(sh, SUMMARY_SHEET, rows=5000, cols=100)
     ws_chart = get_or_create_worksheet(sh, CHART_SHEET, rows=2000, cols=2000)
@@ -243,6 +318,7 @@ def process_once(exchange: ccxt.Exchange, sh):
     symbols = usd_markets(exchange)
     logger.info(f"Found {len(symbols)} Kraken USD spot markets")
 
+    # Bars needed for indicators + sparkline
     margin_bars = max(SMA_720, MACD_SLOW + MACD_SIGNAL + 10, RSI_LEN + 10)
     need_bars = SPARKLINE_BARS + margin_bars
     since_dt = datetime.now(timezone.utc) - timedelta(minutes=15 * need_bars)
@@ -251,7 +327,7 @@ def process_once(exchange: ccxt.Exchange, sh):
     col_idx = 1
     nrows_chart = SPARKLINE_BARS
 
-    for i, sym in enumerate(symbols, start=2):
+    for i, sym in enumerate(symbols, start=2):  # row index in summary sheet
         logger.info(f"Processing {sym}")
         ohlcv15 = fetch_ohlcv_all(exchange, sym, TF, since_ms, limit=FETCH_LIMIT)
         df15 = to_df(ohlcv15)
@@ -278,6 +354,7 @@ def process_once(exchange: ccxt.Exchange, sh):
         macd_signal = float(df15["MACD_signal"].iloc[-1]) if not np.isnan(df15["MACD_signal"].iloc[-1]) else np.nan
         macd_hist = float(df15["MACD_hist"].iloc[-1]) if not np.isnan(df15["MACD_hist"].iloc[-1]) else np.nan
 
+        # Chart data (safe: closes are non-NaN floats)
         write_chart_column(ws_chart, col_idx, sym, closes)
 
         metrics = {
@@ -296,8 +373,9 @@ def process_once(exchange: ccxt.Exchange, sh):
         }
 
         write_summary_row(ws_sum, i, sym, metrics, col_idx, nrows_chart + 1)
-
         col_idx += 1
+
+        # polite pacing for Sheets API
         time.sleep(0.3)
 
     logger.info("Update cycle complete.")
@@ -314,16 +392,17 @@ def main():
 
     exchange = make_exchange()
 
+    # Perpetual loop aligned to 15m boundaries
     while True:
         started = datetime.now(timezone.utc)
-        logger.info(f"\\n===== Cycle start {started.isoformat()} =====")
+        logger.info(f"\n===== Cycle start {started.isoformat()} =====")
         try:
             process_once(exchange, sh)
         except Exception as e:
             logger.exception(f"Cycle error: {e}")
         ended = datetime.now(timezone.utc)
-        elapsed = (ended - started).total_seconds()
 
+        # Sleep until next 15-min boundary or at least `interval`
         now = datetime.now(timezone.utc)
         minutes = now.minute
         sleep_to_next_quarter = ((15 - (minutes % 15)) % 15) * 60 - now.second
