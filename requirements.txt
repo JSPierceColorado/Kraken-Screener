@@ -1,9 +1,8 @@
 ccxt==4.3.48
-pandas==2.2.3
-# pandas_ta 0.4.71b0 needs numpy >= 2.2.6
+pandas==2.3.3
+# pandas_ta 0.4.71b0 requires numpy >= 2.2.6 and pandas >= 2.3.2
 numpy==2.2.6
 pandas_ta==0.4.71b0
-# pandas_ta pulls numba; pin for reliability with py3.12 / numpy 2.2.x
 numba==0.61.2
 gspread==6.1.4
 google-auth==2.35.0
