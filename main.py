@@ -2,7 +2,7 @@ import os
 import json
 import time
 import math
-from typing import Any, Iterable, List
+from typing import Any, Iterable, List, Dict
 from datetime import datetime, timedelta, timezone
 
 from dateutil.relativedelta import relativedelta
@@ -13,6 +13,7 @@ import pandas_ta as ta
 import gspread
 from google.oauth2.service_account import Credentials
 from loguru import logger
+from gspread.exceptions import APIError
 
 SUMMARY_SHEET = "Kraken-Screener"
 CHART_SHEET = "Kraken-Screener-chartData"
@@ -32,6 +33,10 @@ MACD_SIGNAL = 9
 
 # Kraken pagination safety
 FETCH_LIMIT = 500
+
+# Sheets write pacing
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "15"))  # symbols per batch write
+BACKOFF_BASE = 30  # seconds, exponential backoff starting point
 
 
 # ----------------------------
@@ -62,6 +67,23 @@ def column_index_to_letter(idx: int) -> str:
         idx, remainder = divmod(idx - 1, 26)
         letters = chr(65 + remainder) + letters
     return letters
+
+
+def sheets_update_with_backoff(ws, *, values, range_name, value_input_option="RAW", max_retries=5):
+    """Wrapper around worksheet.update with exponential backoff on 429."""
+    delay = BACKOFF_BASE
+    for attempt in range(max_retries):
+        try:
+            return ws.update(values=values, range_name=range_name, value_input_option=value_input_option)
+        except APIError as e:
+            msg = str(e).lower()
+            if "quota exceeded" in msg or "429" in msg or "rate limit" in msg:
+                logger.warning(f"Sheets quota hit; backing off {delay}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    raise RuntimeError("Exceeded max retries on Sheets update due to quota throttling.")
 
 
 # ----------------------------
@@ -117,8 +139,7 @@ def ensure_headers(ws):
     existing = ws.row_values(1)
     if existing != headers:
         ws.clear()
-        # Use new (values-first) signature & USER_ENTERED for nicer formatting
-        ws.update(values=[headers], range_name="A1:N1", value_input_option="USER_ENTERED")
+        sheets_update_with_backoff(ws, values=[headers], range_name="A1:N1", value_input_option="USER_ENTERED")
 
 
 # ----------------------------
@@ -173,7 +194,7 @@ def fetch_ohlcv_all(
         if new_since <= since:
             break
         since = new_since
-        time.sleep(exchange.rateLimit / 1000)
+        time.sleep(max(0.001, exchange.rateLimit / 1000))
         if len(all_rows) > 100000:  # hard cap
             break
     return all_rows
@@ -262,48 +283,87 @@ def fetch_24h_volume(exchange: ccxt.Exchange, symbol: str, df15: pd.DataFrame) -
 
 
 # ----------------------------
-# Sheet writers
+# Sheet writers (batched)
 # ----------------------------
-def write_chart_column(ws_chart, col_idx: int, symbol: str, closes: pd.Series):
-    """Writes the column for the symbol in chart sheet.
-    We keep numbers raw (no NaN because closes is dropna())."""
-    col_letter = column_index_to_letter(col_idx)
-    ws_chart.update_cell(1, col_idx, symbol)
-    if closes is None or closes.empty:
+def write_chart_headers(ws_chart, symbols: List[str]):
+    """Single call to write the header row (symbols) for the chart sheet."""
+    if not symbols:
         return
-    values = [[float(x)] for x in closes.tolist()]
-    ws_chart.update(
+    col_end = column_index_to_letter(len(symbols))
+    values = [symbols]  # one row
+    sheets_update_with_backoff(
+        ws_chart,
         values=values,
-        range_name=f"{col_letter}2:{col_letter}{len(values)+1}",
+        range_name=f"A1:{col_end}1",
+        value_input_option="USER_ENTERED",
+    )
+
+
+def write_chart_block(ws_chart, start_col_idx: int, closes_by_symbol: Dict[str, List[float]], symbol_order: List[str]):
+    """Write a contiguous block of chart data for a batch of symbols in one request.
+    closes_by_symbol[sym] -> list of floats (length SPARKLINE_BARS), no NaNs.
+    """
+    if not symbol_order:
+        return
+    end_col_idx = start_col_idx + len(symbol_order) - 1
+    start_letter = column_index_to_letter(start_col_idx)
+    end_letter = column_index_to_letter(end_col_idx)
+
+    # Build rows (row-major) so gspread can update a rectangle range:
+    # rows: SPARKLINE_BARS, cols: len(symbol_order)
+    rows = []
+    for r in range(SPARKLINE_BARS):
+        row = []
+        for sym in symbol_order:
+            arr = closes_by_symbol.get(sym, [])
+            val = float(arr[r]) if r < len(arr) and math.isfinite(arr[r]) else ""
+            row.append(val)
+        rows.append(row)
+
+    sheets_update_with_backoff(
+        ws_chart,
+        values=rows,
+        range_name=f"{start_letter}2:{end_letter}{SPARKLINE_BARS+1}",
         value_input_option="RAW",
     )
 
 
-def write_summary_row(ws_sum, row_idx: int, symbol: str, metrics: dict, spark_col_idx: int, nrows_chart: int):
-    col_letter = column_index_to_letter(spark_col_idx)
-    spark_formula = f"=SPARKLINE('{CHART_SHEET}'!{col_letter}2:{col_letter}{nrows_chart})"
+def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_by_symbol: Dict[str, Dict[str, Any]], symbol_order: List[str]):
+    """Write a contiguous block of summary rows for a batch of symbols in one request."""
+    if not symbol_order:
+        return
+    # Build summary rows, one per symbol
+    rows = []
+    for i, sym in enumerate(symbol_order):
+        col_idx = start_col_idx + i
+        col_letter = column_index_to_letter(col_idx)
+        spark_formula = f"=SPARKLINE('{CHART_SHEET}'!{col_letter}2:{col_letter}{SPARKLINE_BARS+1})"
 
-    row = [
-        symbol,
-        metrics.get("last_price"),
-        metrics.get("pct_down_from_ath"),
-        metrics.get("pl1d"),
-        metrics.get("pl7d"),
-        metrics.get("pl14d"),
-        metrics.get("vol24h"),
-        metrics.get("rsi14"),
-        metrics.get("sma240"),
-        metrics.get("sma720"),
-        metrics.get("macd"),
-        metrics.get("macd_signal"),
-        metrics.get("macd_hist"),
-        spark_formula,
-    ]
-    clean = sanitize_row(row)
-    ws_sum.update(
-        values=[clean],
-        range_name=f"A{row_idx}:N{row_idx}",
-        value_input_option="USER_ENTERED",  # needed so sparkline formula is parsed
+        m = metrics_by_symbol[sym]
+        row = [
+            sym,
+            m.get("last_price"),
+            m.get("pct_down_from_ath"),
+            m.get("pl1d"),
+            m.get("pl7d"),
+            m.get("pl14d"),
+            m.get("vol24h"),
+            m.get("rsi14"),
+            m.get("sma240"),
+            m.get("sma720"),
+            m.get("macd"),
+            m.get("macd_signal"),
+            m.get("macd_hist"),
+            spark_formula,
+        ]
+        rows.append(sanitize_row(row))
+
+    end_row_idx = start_row_idx + len(symbol_order) - 1
+    sheets_update_with_backoff(
+        ws_sum,
+        values=rows,
+        range_name=f"A{start_row_idx}:N{end_row_idx}",
+        value_input_option="USER_ENTERED",
     )
 
 
@@ -311,12 +371,15 @@ def write_summary_row(ws_sum, row_idx: int, symbol: str, metrics: dict, spark_co
 # Main loop
 # ----------------------------
 def process_once(exchange: ccxt.Exchange, sh):
-    ws_sum = get_or_create_worksheet(sh, SUMMARY_SHEET, rows=5000, cols=100)
-    ws_chart = get_or_create_worksheet(sh, CHART_SHEET, rows=2000, cols=2000)
+    ws_sum = get_or_create_worksheet(sh, SUMMARY_SHEET, rows=6000, cols=100)
+    ws_chart = get_or_create_worksheet(sh, CHART_SHEET, rows=SPARKLINE_BARS + 10, cols=3000)
     ensure_headers(ws_sum)
 
     symbols = usd_markets(exchange)
     logger.info(f"Found {len(symbols)} Kraken USD spot markets")
+
+    # Write chart header row once per cycle (all symbols at once)
+    write_chart_headers(ws_chart, symbols)
 
     # Bars needed for indicators + sparkline
     margin_bars = max(SMA_720, MACD_SLOW + MACD_SIGNAL + 10, RSI_LEN + 10)
@@ -324,59 +387,86 @@ def process_once(exchange: ccxt.Exchange, sh):
     since_dt = datetime.now(timezone.utc) - timedelta(minutes=15 * need_bars)
     since_ms = int(since_dt.timestamp() * 1000)
 
-    col_idx = 1
-    nrows_chart = SPARKLINE_BARS
+    # We maintain stable positions: column index for a symbol is 1 + its index in `symbols`
+    # Summary row index for a symbol is 2 + its index in `symbols`
+    for chunk_start in range(0, len(symbols), BATCH_SIZE):
+        chunk_syms = symbols[chunk_start:chunk_start + BATCH_SIZE]
+        start_col_idx = 1 + chunk_start
+        start_row_idx = 2 + chunk_start
 
-    for i, sym in enumerate(symbols, start=2):  # row index in summary sheet
-        logger.info(f"Processing {sym}")
-        ohlcv15 = fetch_ohlcv_all(exchange, sym, TF, since_ms, limit=FETCH_LIMIT)
-        df15 = to_df(ohlcv15)
-        if df15.empty:
-            logger.warning(f"No 15m data for {sym}")
-            continue
+        closes_by_symbol: Dict[str, List[float]] = {}
+        metrics_by_symbol: Dict[str, Dict[str, Any]] = {}
 
-        df15 = compute_indicators(df15)
-        closes = df15["close"].dropna().iloc[-SPARKLINE_BARS:]
+        for sym in chunk_syms:
+            logger.info(f"Processing {sym}")
+            ohlcv15 = fetch_ohlcv_all(exchange, sym, TF, since_ms, limit=FETCH_LIMIT)
+            df15 = to_df(ohlcv15)
+            if df15.empty:
+                logger.warning(f"No 15m data for {sym}")
+                # fill with blanks to keep alignment
+                closes_by_symbol[sym] = []
+                metrics_by_symbol[sym] = {
+                    "last_price": "",
+                    "pct_down_from_ath": "",
+                    "pl1d": "",
+                    "pl7d": "",
+                    "pl14d": "",
+                    "vol24h": "",
+                    "rsi14": "",
+                    "sma240": "",
+                    "sma720": "",
+                    "macd": "",
+                    "macd_signal": "",
+                    "macd_hist": "",
+                }
+                continue
 
-        last_price = float(df15["close"].iloc[-1])
-        pl1d = compute_pl(df15, 1)
-        pl7d = compute_pl(df15, 7)
-        pl14d = compute_pl(df15, 14)
-        vol24h = fetch_24h_volume(exchange, sym, df15)
+            df15 = compute_indicators(df15)
+            closes = df15["close"].dropna().iloc[-SPARKLINE_BARS:]
+            closes_by_symbol[sym] = [float(x) for x in closes.tolist()]
 
-        ath = fetch_ath(exchange, sym)
-        pct_down_ath = float((last_price - ath) / ath * 100.0) if ath and ath > 0 else np.nan
+            last_price = float(df15["close"].iloc[-1])
+            pl1d = compute_pl(df15, 1)
+            pl7d = compute_pl(df15, 7)
+            pl14d = compute_pl(df15, 14)
+            vol24h = fetch_24h_volume(exchange, sym, df15)
 
-        rsi14 = float(df15["RSI14"].iloc[-1]) if not np.isnan(df15["RSI14"].iloc[-1]) else np.nan
-        sma240 = float(df15["SMA240"].iloc[-1]) if not np.isnan(df15["SMA240"].iloc[-1]) else np.nan
-        sma720 = float(df15["SMA720"].iloc[-1]) if not np.isnan(df15["SMA720"].iloc[-1]) else np.nan
-        macd = float(df15["MACD"].iloc[-1]) if not np.isnan(df15["MACD"].iloc[-1]) else np.nan
-        macd_signal = float(df15["MACD_signal"].iloc[-1]) if not np.isnan(df15["MACD_signal"].iloc[-1]) else np.nan
-        macd_hist = float(df15["MACD_hist"].iloc[-1]) if not np.isnan(df15["MACD_hist"].iloc[-1]) else np.nan
+            ath = fetch_ath(exchange, sym)
+            pct_down_ath = float((last_price - ath) / ath * 100.0) if ath and ath > 0 else np.nan
 
-        # Chart data (safe: closes are non-NaN floats)
-        write_chart_column(ws_chart, col_idx, sym, closes)
+            rsi14 = float(df15["RSI14"].iloc[-1]) if not np.isnan(df15["RSI14"].iloc[-1]) else np.nan
+            sma240 = float(df15["SMA240"].iloc[-1]) if not np.isnan(df15["SMA240"].iloc[-1]) else np.nan
+            sma720 = float(df15["SMA720"].iloc[-1]) if not np.isnan(df15["SMA720"].iloc[-1]) else np.nan
+            macd = float(df15["MACD"].iloc[-1]) if not np.isnan(df15["MACD"].iloc[-1]) else np.nan
+            macd_signal = float(df15["MACD_signal"].iloc[-1]) if not np.isnan(df15["MACD_signal"].iloc[-1]) else np.nan
+            macd_hist = float(df15["MACD_hist"].iloc[-1]) if not np.isnan(df15["MACD_hist"].iloc[-1]) else np.nan
 
-        metrics = {
-            "last_price": last_price,
-            "pct_down_from_ath": pct_down_ath,
-            "pl1d": pl1d,
-            "pl7d": pl7d,
-            "pl14d": pl14d,
-            "vol24h": vol24h,
-            "rsi14": rsi14,
-            "sma240": sma240,
-            "sma720": sma720,
-            "macd": macd,
-            "macd_signal": macd_signal,
-            "macd_hist": macd_hist,
-        }
+            metrics_by_symbol[sym] = {
+                "last_price": last_price,
+                "pct_down_from_ath": pct_down_ath,
+                "pl1d": pl1d,
+                "pl7d": pl7d,
+                "pl14d": pl14d,
+                "vol24h": vol24h,
+                "rsi14": rsi14,
+                "sma240": sma240,
+                "sma720": sma720,
+                "macd": macd,
+                "macd_signal": macd_signal,
+                "macd_hist": macd_hist,
+            }
 
-        write_summary_row(ws_sum, i, sym, metrics, col_idx, nrows_chart + 1)
-        col_idx += 1
+            # Gentle pacing for Kraken
+            time.sleep(0.05)
 
-        # polite pacing for Sheets API
-        time.sleep(0.3)
+        # Write chart block for this batch
+        write_chart_block(ws_chart, start_col_idx, closes_by_symbol, chunk_syms)
+
+        # Write summary rows for this batch
+        write_summary_block(ws_sum, start_row_idx, start_col_idx, metrics_by_symbol, chunk_syms)
+
+        # Small pause between batches to avoid per-minute caps
+        time.sleep(1.0)
 
     logger.info("Update cycle complete.")
 
