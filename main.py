@@ -5,7 +5,6 @@ import math
 from typing import Any, Iterable, List, Dict
 from datetime import datetime, timedelta, timezone
 
-from dateutil.relativedelta import relativedelta
 import ccxt
 import pandas as pd
 import numpy as np
@@ -382,7 +381,7 @@ def write_summary_block(ws_sum, start_row_idx: int, start_col_idx: int, metrics_
 
 
 # ----------------------------
-# Main loop
+# Main process (single cycle)
 # ----------------------------
 def process_once(exchange: ccxt.Exchange, sh):
     ws_sum = get_or_create_worksheet(sh, SUMMARY_SHEET, rows=6000, cols=100)
@@ -481,7 +480,6 @@ def process_once(exchange: ccxt.Exchange, sh):
 
 def main():
     sheets_name = os.getenv("GOOGLE_SHEETS_NAME", "Trading Log")
-    interval = int(os.getenv("UPDATE_INTERVAL_SECONDS", "900"))
 
     logger.add(lambda msg: print(msg, end=""))
 
@@ -490,25 +488,16 @@ def main():
 
     exchange = make_exchange()
 
-    # Perpetual loop aligned to 15m boundaries
-    while True:
-        started = datetime.now(timezone.utc)
-        logger.info(f"\n===== Cycle start {started.isoformat()} =====")
-        try:
-            process_once(exchange, sh)
-        except Exception as e:
-            logger.exception(f"Cycle error: {e}")
-        ended = datetime.now(timezone.utc)
-
-        # Sleep until next 15-min boundary or at least `interval`
-        now = datetime.now(timezone.utc)
-        minutes = now.minute
-        sleep_to_next_quarter = ((15 - (minutes % 15)) % 15) * 60 - now.second
-        sleep_seconds = max(interval, sleep_to_next_quarter)
-        if sleep_seconds < 60:
-            sleep_seconds = interval
-        logger.info(f"Sleeping {int(sleep_seconds)}s...")
-        time.sleep(sleep_seconds)
+    started = datetime.now(timezone.utc)
+    logger.info(f"\n===== Single cycle start {started.isoformat()} =====")
+    try:
+        process_once(exchange, sh)
+    except Exception as e:
+        logger.exception(f"Cycle error: {e}")
+        # Optionally re-raise if you want cron to see a non-zero exit code:
+        # raise
+    ended = datetime.now(timezone.utc)
+    logger.info(f"Single cycle complete at {ended.isoformat()}")
 
 
 if __name__ == "__main__":
