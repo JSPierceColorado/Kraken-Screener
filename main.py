@@ -181,6 +181,23 @@ def usd_markets(exchange: ccxt.Exchange) -> List[str]:
     return sorted(set(syms))
 
 
+def load_symbol_blacklist():
+    """
+    Load a symbol blacklist from the SYMBOL_BLACKLIST env var.
+
+    Expected format (comma-separated):
+        SYMBOL_BLACKLIST="BTC/USD,ETH/USD,PEPE/USD"
+
+    All entries are uppercased and compared against the full Kraken symbol,
+    e.g. 'BTC/USD'.
+    """
+    raw = os.getenv("SYMBOL_BLACKLIST", "")
+    if not raw:
+        return set()
+    blacklist = {s.strip().upper() for s in raw.split(",") if s.strip()}
+    return blacklist
+
+
 def fetch_ohlcv_all(
     exchange: ccxt.Exchange, symbol: str, timeframe: str, since_ms: int, limit: int = FETCH_LIMIT
 ) -> list:
@@ -389,7 +406,26 @@ def process_once(exchange: ccxt.Exchange, sh):
     ensure_headers(ws_sum)  # only writes A1:M1
 
     symbols = usd_markets(exchange)
-    logger.info(f"Found {len(symbols)} Kraken USD spot markets")
+    logger.info(f"Found {len(symbols)} Kraken USD spot markets before blacklist filter")
+
+    # Apply blacklist (if any) to skip work for certain symbols entirely
+    blacklist = load_symbol_blacklist()
+    if blacklist:
+        before = len(symbols)
+        symbols = [s for s in symbols if s.upper() not in blacklist]
+        skipped = before - len(symbols)
+        logger.info(
+            f"Loaded SYMBOL_BLACKLIST with {len(blacklist)} entries; "
+            f"skipped {skipped} symbols, {len(symbols)} remain."
+        )
+    else:
+        logger.info("No SYMBOL_BLACKLIST configured; processing all markets.")
+
+    if not symbols:
+        logger.warning("No symbols left to process after applying blacklist; exiting cycle early.")
+        return
+
+    logger.info(f"Processing {len(symbols)} Kraken USD spot markets after blacklist filter")
 
     # Write chart header row once per cycle (all symbols at once)
     write_chart_headers(ws_chart, symbols)
