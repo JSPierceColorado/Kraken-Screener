@@ -6,6 +6,9 @@ ORDER_BOOK_COUNT=100
 MAX_CONCURRENT_REQUESTS=8
 OUTPUT_PATH=/app/output/screener_latest.csv
 
+# Logging
+LOG_LEVEL=INFO
+
 # Continuous run mode
 RUN_CONTINUOUSLY=true
 RUN_INTERVAL_SECONDS=300

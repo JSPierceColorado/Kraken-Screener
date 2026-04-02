@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -63,6 +64,26 @@ RUN_INTERVAL_SECONDS = max(float(os.getenv("RUN_INTERVAL_SECONDS", "300")), 15.0
 RUN_ON_STARTUP = os.getenv("RUN_ON_STARTUP", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+
+
+def configure_logging() -> logging.Logger:
+    numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
+    )
+    logging.getLogger("uvicorn.access").setLevel(numeric_level)
+    logging.getLogger("uvicorn.error").setLevel(numeric_level)
+    logger = logging.getLogger("kraken_screener")
+    logger.setLevel(numeric_level)
+    return logger
+
+
+logger = configure_logging()
+
+
 
 class KrakenPublicClient:
     def __init__(self) -> None:
@@ -80,14 +101,19 @@ class KrakenPublicClient:
         return self._semaphore
 
     async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        request_params = params or {}
         async with self.semaphore:
-            response = await self.client.get(f"{KRAKEN_BASE_URL}{endpoint}", params=params or {})
+            logger.debug("Kraken GET start endpoint=%s params=%s", endpoint, request_params)
+            response = await self.client.get(f"{KRAKEN_BASE_URL}{endpoint}", params=request_params)
             response.raise_for_status()
             payload = response.json()
             errors = payload.get("error", [])
             if errors:
+                logger.error("Kraken API error endpoint=%s errors=%s", endpoint, errors)
                 raise RuntimeError(f"Kraken API error for {endpoint}: {errors}")
-            return payload.get("result", {})
+            result = payload.get("result", {})
+            logger.debug("Kraken GET done endpoint=%s keys=%s", endpoint, list(result.keys())[:10])
+            return result
 
 
 @app.on_event("startup")
@@ -108,12 +134,26 @@ async def on_startup() -> None:
     app.state.scheduler_consecutive_failures = 0
     app.state.scheduler_next_run_at = None
     app.state.scheduler_task = None
+    logger.info(
+        "Startup complete run_continuously=%s run_interval_seconds=%s run_on_startup=%s use_whitelist=%s output_path=%s google_sheets_enabled=%s google_sheets_configured=%s",
+        RUN_CONTINUOUSLY,
+        RUN_INTERVAL_SECONDS,
+        RUN_ON_STARTUP,
+        USE_WHITELIST,
+        str(OUTPUT_PATH),
+        GOOGLE_SHEETS_ENABLED,
+        google_sheets_configured(),
+    )
     if RUN_CONTINUOUSLY:
+        logger.info("Starting scheduler loop task")
         app.state.scheduler_task = asyncio.create_task(scheduler_loop(), name="kraken-screener-scheduler")
+    else:
+        logger.info("Scheduler loop disabled by RUN_CONTINUOUSLY=false")
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    logger.info("Shutdown started")
     scheduler_task = getattr(app.state, "scheduler_task", None)
     if scheduler_task is not None:
         scheduler_task.cancel()
@@ -124,6 +164,7 @@ async def on_shutdown() -> None:
     client = getattr(app.state, "kraken", None)
     if client is not None:
         await client.aclose()
+    logger.info("Shutdown complete")
 
 
 def env_whitelist_tokens() -> List[str]:
@@ -1201,8 +1242,15 @@ async def execute_screen_run(
     sync_sheet_override: Optional[bool] = None,
     run_source: str = "manual",
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    logger.info(
+        "Screen run requested source=%s selected_pairs_override_count=%s sync_sheet_override=%s",
+        run_source,
+        len(selected_pairs) if selected_pairs else None,
+        sync_sheet_override,
+    )
     async with app.state.run_lock:
         started_at = datetime.now(timezone.utc)
+        logger.info("Screen run started source=%s", run_source)
         frame, metadata = await build_screener_dataframe(selected_pairs=selected_pairs)
         metadata["run_source"] = run_source
         metadata["run_started_at_utc"] = started_at.isoformat()
@@ -1214,11 +1262,21 @@ async def execute_screen_run(
         app.state.latest_run_metadata = metadata
 
         should_sync_sheet = GOOGLE_SHEETS_SYNC_ON_RUN if sync_sheet_override is None else bool(sync_sheet_override)
+        logger.info(
+            "Screen run built rows=%s elapsed_seconds=%s source=%s should_sync_sheet=%s",
+            len(frame),
+            metadata.get("elapsed_seconds"),
+            run_source,
+            should_sync_sheet,
+        )
         if should_sync_sheet:
             if google_sheets_configured():
                 try:
+                    logger.info("Pushing screener dataframe to Google Sheets")
                     metadata["google_sheets_sync"] = await asyncio.to_thread(push_dataframe_to_google_sheet, frame)
+                    logger.info("Google Sheets sync complete result=%s", metadata["google_sheets_sync"])
                 except Exception as exc:
+                    logger.exception("Google Sheets sync failed")
                     metadata["google_sheets_sync"] = {"enabled": True, "status": "error", "error": str(exc)}
             else:
                 metadata["google_sheets_sync"] = {
@@ -1229,19 +1287,23 @@ async def execute_screen_run(
                     "worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
                     "service_account_email": google_sheets_service_account_email(),
                 }
+        logger.info("Screen run finished source=%s rows=%s", run_source, len(frame))
         return frame, metadata
 
 
 async def scheduler_loop() -> None:
     first_cycle = True
+    logger.info("Scheduler loop entered")
     while True:
         try:
             if first_cycle and not RUN_ON_STARTUP:
+                logger.info("Scheduler delaying first cycle by %s seconds because RUN_ON_STARTUP=false", RUN_INTERVAL_SECONDS)
                 next_run_at = datetime.now(timezone.utc).timestamp() + RUN_INTERVAL_SECONDS
                 app.state.scheduler_next_run_at = datetime.fromtimestamp(next_run_at, tz=timezone.utc).isoformat()
                 await asyncio.sleep(RUN_INTERVAL_SECONDS)
 
             app.state.scheduler_iteration += 1
+            logger.info("Scheduler iteration=%s starting", app.state.scheduler_iteration)
             app.state.scheduler_last_started_at = datetime.now(timezone.utc).isoformat()
             app.state.scheduler_last_status = "running"
             app.state.scheduler_last_error = None
@@ -1251,12 +1313,14 @@ async def scheduler_loop() -> None:
                 await execute_screen_run(run_source="scheduler")
                 app.state.scheduler_last_status = "ok"
                 app.state.scheduler_consecutive_failures = 0
+                logger.info("Scheduler iteration=%s completed successfully", app.state.scheduler_iteration)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 app.state.scheduler_last_status = "error"
                 app.state.scheduler_last_error = str(exc)
                 app.state.scheduler_consecutive_failures += 1
+                logger.exception("Scheduler iteration=%s failed", app.state.scheduler_iteration)
 
             app.state.scheduler_last_completed_at = datetime.now(timezone.utc).isoformat()
             next_run_at = datetime.now(timezone.utc).timestamp() + RUN_INTERVAL_SECONDS
@@ -1438,6 +1502,7 @@ async def build_screener_dataframe(selected_pairs: Optional[List[str]] = None) -
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(OUTPUT_PATH, index=False)
+    logger.info("Wrote screener csv path=%s rows=%s", str(OUTPUT_PATH), len(frame))
     elapsed = time.perf_counter() - started
     metadata = {
         "pair_count": int(len(frame)),
@@ -1537,7 +1602,7 @@ async def pairs() -> Dict[str, Any]:
 
 @app.get("/sheet/status")
 async def sheet_status() -> Dict[str, Any]:
-    return {
+    result = {
         "enabled": GOOGLE_SHEETS_ENABLED,
         "sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
         "configured": google_sheets_configured(),
@@ -1563,6 +1628,7 @@ async def run_screener(
     selected_pairs = None
     if whitelist:
         selected_pairs = [token.strip() for token in whitelist.split(",") if token.strip()]
+    logger.info("Manual /run invoked whitelist_override_count=%s preview_rows=%s sync_sheet=%s", len(selected_pairs) if selected_pairs else None, preview_rows, sync_sheet)
 
     frame, metadata = await execute_screen_run(
         selected_pairs=selected_pairs,
@@ -1576,6 +1642,7 @@ async def run_screener(
 
 @app.get("/sheet/push")
 async def push_latest_to_sheet() -> JSONResponse:
+    logger.info("Manual /sheet/push invoked")
     if app.state.latest_df is None:
         if not OUTPUT_PATH.exists():
             raise HTTPException(status_code=404, detail="No screener output exists yet. Run /run first.")
@@ -1593,6 +1660,7 @@ async def push_latest_to_sheet() -> JSONResponse:
     try:
         result = await asyncio.to_thread(push_dataframe_to_google_sheet, app.state.latest_df)
     except Exception as exc:
+        logger.exception("Manual /sheet/push failed")
         raise HTTPException(status_code=500, detail=f"Failed to push screener results to Google Sheets: {exc}") from exc
 
     return JSONResponse({"sheet_sync": result})
