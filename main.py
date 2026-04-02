@@ -1,16 +1,22 @@
 import asyncio
+import base64
+import json
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import google.auth
 import httpx
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 try:
     from ta import add_all_ta_features
@@ -41,6 +47,16 @@ WHITELIST_RAW = os.getenv("WHITELIST", "")
 OHLC_WINDOW_LIMIT = int(os.getenv("OHLC_WINDOW_LIMIT", "720"))
 MIN_CANDLES_REQUIRED = int(os.getenv("MIN_CANDLES_REQUIRED", "80"))
 USD_QUOTES = {"USD", "ZUSD"}
+
+GOOGLE_SHEETS_ENABLED = os.getenv("GOOGLE_SHEETS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+GOOGLE_SHEETS_SYNC_ON_RUN = os.getenv("GOOGLE_SHEETS_SYNC_ON_RUN", "true").strip().lower() in {"1", "true", "yes", "on"}
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+GOOGLE_SHEETS_SPREADSHEET_URL = os.getenv("GOOGLE_SHEETS_SPREADSHEET_URL", "").strip()
+GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "Screener").strip() or "Screener"
+GOOGLE_SHEETS_VALUE_INPUT_OPTION = os.getenv("GOOGLE_SHEETS_VALUE_INPUT_OPTION", "RAW").strip().upper() or "RAW"
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 class KrakenPublicClient:
@@ -87,6 +103,206 @@ async def on_shutdown() -> None:
 def env_whitelist_tokens() -> List[str]:
     return [token.strip() for token in WHITELIST_RAW.split(",") if token.strip()]
 
+
+def parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def extract_google_sheet_id(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", candidate)
+    if match:
+        return match.group(1)
+    return candidate
+
+
+def sanitize_sheet_title(value: str) -> str:
+    title = (value or "Screener").strip() or "Screener"
+    title = re.sub(r"[\[\]\*\?/\\:]", "_", title)
+    return title[:100]
+
+
+def google_sheets_service_account_email() -> Optional[str]:
+    try:
+        if GOOGLE_SERVICE_ACCOUNT_JSON:
+            return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email")
+        if GOOGLE_SERVICE_ACCOUNT_JSON_B64:
+            decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
+            return json.loads(decoded).get("client_email")
+    except Exception:
+        return None
+    return None
+
+
+def load_google_sheets_credentials():
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        return service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SHEETS_SCOPES)
+    if GOOGLE_SERVICE_ACCOUNT_JSON_B64:
+        decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
+        info = json.loads(decoded)
+        return service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SHEETS_SCOPES)
+    credentials, _ = google.auth.default(scopes=GOOGLE_SHEETS_SCOPES)
+    return credentials
+
+
+def google_sheets_target_id() -> str:
+    spreadsheet_id = extract_google_sheet_id(GOOGLE_SHEETS_SPREADSHEET_ID)
+    if spreadsheet_id:
+        return spreadsheet_id
+    spreadsheet_id = extract_google_sheet_id(GOOGLE_SHEETS_SPREADSHEET_URL)
+    if spreadsheet_id:
+        return spreadsheet_id
+    return ""
+
+
+def google_sheets_configured() -> bool:
+    return GOOGLE_SHEETS_ENABLED and bool(google_sheets_target_id())
+
+
+def build_google_sheets_service():
+    credentials = load_google_sheets_credentials()
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+
+def dataframe_to_sheet_values(frame: pd.DataFrame) -> List[List[Any]]:
+    if frame is None or frame.empty:
+        return [list(frame.columns)] if frame is not None else [[]]
+
+    export_frame = frame.copy()
+    export_frame = export_frame.where(pd.notnull(export_frame), None)
+
+    values: List[List[Any]] = [list(export_frame.columns)]
+    for row in export_frame.itertuples(index=False, name=None):
+        converted_row: List[Any] = []
+        for value in row:
+            if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                converted_row.append("")
+            elif isinstance(value, (pd.Timestamp, datetime)):
+                converted_row.append(value.isoformat())
+            elif isinstance(value, (np.integer,)):
+                converted_row.append(int(value))
+            elif isinstance(value, (np.floating, float)):
+                converted_row.append(float(value))
+            elif isinstance(value, (np.bool_, bool)):
+                converted_row.append(bool(value))
+            elif isinstance(value, (dict, list, tuple)):
+                converted_row.append(json.dumps(value, default=str))
+            else:
+                converted_row.append(value)
+        values.append(converted_row)
+    return values
+
+
+def ensure_google_worksheet(service, spreadsheet_id: str, worksheet_name: str) -> None:
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheets = spreadsheet.get("sheets", [])
+    titles = {sheet.get("properties", {}).get("title") for sheet in sheets}
+    if worksheet_name in titles:
+        return
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": worksheet_name}}}]},
+    ).execute()
+
+
+def push_dataframe_to_google_sheet(frame: pd.DataFrame) -> Dict[str, Any]:
+    if frame is None:
+        raise ValueError("No dataframe is loaded yet.")
+
+    spreadsheet_id = google_sheets_target_id()
+    if not spreadsheet_id:
+        raise ValueError("Google Sheets is not configured: missing GOOGLE_SHEETS_SPREADSHEET_ID or GOOGLE_SHEETS_SPREADSHEET_URL.")
+
+    worksheet_name = sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME)
+    service = build_google_sheets_service()
+    ensure_google_worksheet(service, spreadsheet_id, worksheet_name)
+
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id = None
+    for sheet in spreadsheet.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == worksheet_name:
+            sheet_id = props.get("sheetId")
+            break
+    if sheet_id is None:
+        raise ValueError(f"Unable to locate worksheet '{worksheet_name}' after creation.")
+
+    values = dataframe_to_sheet_values(frame)
+    range_name = f"'{worksheet_name}'!A1"
+    clear_range = f"'{worksheet_name}'"
+    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=clear_range).execute()
+    update_result = service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        valueInputOption=GOOGLE_SHEETS_VALUE_INPUT_OPTION,
+        body={"values": values},
+    ).execute()
+
+    column_count = max(len(frame.columns), 1)
+    row_count = max(len(frame) + 1, 1)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {"frozenRowCount": 1},
+                        },
+                        "fields": "gridProperties.frozenRowCount",
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat.bold",
+                    }
+                },
+                {
+                    "setBasicFilter": {
+                        "filter": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,
+                                "endRowIndex": row_count,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": column_count,
+                            }
+                        }
+                    }
+                },
+                {
+                    "autoResizeDimensions": {
+                        "dimensions": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 0,
+                            "endIndex": column_count,
+                        }
+                    }
+                },
+            ]
+        },
+    ).execute()
+
+    updated_cells = update_result.get("updatedCells")
+    return {
+        "enabled": True,
+        "spreadsheet_id": spreadsheet_id,
+        "worksheet_name": worksheet_name,
+        "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+        "updated_rows_including_header": len(values),
+        "updated_columns": column_count,
+        "updated_cells": updated_cells,
+        "service_account_email": google_sheets_service_account_email(),
+    }
 
 def to_float(value: Any) -> Optional[float]:
     if value is None:
@@ -1117,6 +1333,12 @@ async def build_screener_dataframe(selected_pairs: Optional[List[str]] = None) -
         "whitelist": whitelist_tokens,
         "ta_available": TA_AVAILABLE,
         "ta_import_error": TA_IMPORT_ERROR,
+        "google_sheets_enabled": GOOGLE_SHEETS_ENABLED,
+        "google_sheets_sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+        "google_sheets_configured": google_sheets_configured(),
+        "google_sheets_spreadsheet_id": google_sheets_target_id() or None,
+        "google_sheets_worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+        "google_sheets_service_account_email": google_sheets_service_account_email(),
     }
     return frame, metadata
 
@@ -1126,13 +1348,18 @@ async def root() -> Dict[str, Any]:
     return {
         "service": "kraken-usd-screener",
         "status": "ok",
-        "endpoints": ["/health", "/pairs", "/run", "/preview", "/download/latest.csv"],
+        "endpoints": ["/health", "/pairs", "/run", "/preview", "/download/latest.csv", "/sheet/status", "/sheet/push"],
         "defaults": {
             "quote_filter": "USD",
             "use_whitelist": USE_WHITELIST,
             "ohlc_interval_minutes": OHLC_INTERVAL,
             "order_book_count": ORDER_BOOK_COUNT,
             "output_path": str(OUTPUT_PATH),
+            "google_sheets_enabled": GOOGLE_SHEETS_ENABLED,
+            "google_sheets_sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+            "google_sheets_spreadsheet_id": google_sheets_target_id() or None,
+            "google_sheets_worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+            "google_sheets_service_account_email": google_sheets_service_account_email(),
         },
     }
 
@@ -1145,6 +1372,12 @@ async def health() -> Dict[str, Any]:
         "ta_import_error": TA_IMPORT_ERROR,
         "latest_generated_at": app.state.latest_generated_at,
         "output_exists": OUTPUT_PATH.exists(),
+        "google_sheets_enabled": GOOGLE_SHEETS_ENABLED,
+        "google_sheets_sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+        "google_sheets_configured": google_sheets_configured(),
+        "google_sheets_spreadsheet_id": google_sheets_target_id() or None,
+        "google_sheets_worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+        "google_sheets_service_account_email": google_sheets_service_account_email(),
     }
 
 
@@ -1175,10 +1408,24 @@ async def pairs() -> Dict[str, Any]:
     }
 
 
+@app.get("/sheet/status")
+async def sheet_status() -> Dict[str, Any]:
+    return {
+        "enabled": GOOGLE_SHEETS_ENABLED,
+        "sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+        "configured": google_sheets_configured(),
+        "spreadsheet_id": google_sheets_target_id() or None,
+        "worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+        "service_account_email": google_sheets_service_account_email(),
+        "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{google_sheets_target_id()}/edit" if google_sheets_target_id() else None,
+    }
+
+
 @app.get("/run")
 async def run_screener(
     whitelist: Optional[str] = Query(default=None, description="Comma-separated pair list to override the env whitelist for this run."),
     preview_rows: int = Query(default=10, ge=1, le=100),
+    sync_sheet: Optional[bool] = Query(default=None, description="Override the default behavior and push the latest screener results into Google Sheets."),
 ) -> JSONResponse:
     selected_pairs = None
     if whitelist:
@@ -1189,8 +1436,49 @@ async def run_screener(
     app.state.latest_generated_at = metadata["generated_at_utc"]
     app.state.latest_run_seconds = metadata["elapsed_seconds"]
 
+    should_sync_sheet = GOOGLE_SHEETS_SYNC_ON_RUN if sync_sheet is None else bool(sync_sheet)
+    if should_sync_sheet:
+        if google_sheets_configured():
+            try:
+                metadata["google_sheets_sync"] = await asyncio.to_thread(push_dataframe_to_google_sheet, frame)
+            except Exception as exc:
+                metadata["google_sheets_sync"] = {"enabled": True, "status": "error", "error": str(exc)}
+        else:
+            metadata["google_sheets_sync"] = {
+                "enabled": GOOGLE_SHEETS_ENABLED,
+                "status": "skipped",
+                "reason": "Google Sheets is not fully configured.",
+                "spreadsheet_id": google_sheets_target_id() or None,
+                "worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+                "service_account_email": google_sheets_service_account_email(),
+            }
+
     preview = [] if frame.empty else frame.head(preview_rows).replace({np.nan: None}).to_dict(orient="records")
     return JSONResponse({"metadata": metadata, "preview": preview})
+
+
+@app.get("/sheet/push")
+async def push_latest_to_sheet() -> JSONResponse:
+    if app.state.latest_df is None:
+        if not OUTPUT_PATH.exists():
+            raise HTTPException(status_code=404, detail="No screener output exists yet. Run /run first.")
+        app.state.latest_df = pd.read_csv(OUTPUT_PATH)
+
+    if not google_sheets_configured():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Sheets is not fully configured. Set GOOGLE_SHEETS_ENABLED=true, provide "
+                "GOOGLE_SHEETS_SPREADSHEET_ID or GOOGLE_SHEETS_SPREADSHEET_URL, and attach valid Google credentials."
+            ),
+        )
+
+    try:
+        result = await asyncio.to_thread(push_dataframe_to_google_sheet, app.state.latest_df)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to push screener results to Google Sheets: {exc}") from exc
+
+    return JSONResponse({"sheet_sync": result})
 
 
 @app.get("/preview")
