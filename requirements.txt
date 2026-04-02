@@ -1,8 +1,1615 @@
-fastapi>=0.116,<1.0
-uvicorn>=0.35,<1.0
-httpx>=0.28,<1.0
-pandas>=2.3,<3.0
-numpy>=2.3,<3.0
-ta>=0.11,<1.0
-google-api-python-client>=2.169,<3.0
-google-auth>=2.41,<3.0
+import asyncio
+import base64
+import json
+import math
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import google.auth
+import httpx
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+try:
+    from ta import add_all_ta_features
+    TA_AVAILABLE = True
+    TA_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover
+    TA_AVAILABLE = False
+    TA_IMPORT_ERROR = str(exc)
+
+
+app = FastAPI(
+    title="Kraken USD Screener",
+    version="1.0.0",
+    description=(
+        "Screens all Kraken USD spot pairs, calculates trading metrics per crypto, and exports the"
+        " latest screener snapshot to CSV."
+    ),
+)
+
+KRAKEN_BASE_URL = os.getenv("KRAKEN_BASE_URL", "https://api.kraken.com/0/public")
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "8"))
+OHLC_INTERVAL = int(os.getenv("OHLC_INTERVAL", "5"))
+ORDER_BOOK_COUNT = int(os.getenv("ORDER_BOOK_COUNT", "100"))
+OUTPUT_PATH = Path(os.getenv("OUTPUT_PATH", "/app/output/screener_latest.csv"))
+USE_WHITELIST = os.getenv("USE_WHITELIST", "false").strip().lower() in {"1", "true", "yes", "on"}
+WHITELIST_RAW = os.getenv("WHITELIST", "")
+OHLC_WINDOW_LIMIT = int(os.getenv("OHLC_WINDOW_LIMIT", "720"))
+MIN_CANDLES_REQUIRED = int(os.getenv("MIN_CANDLES_REQUIRED", "80"))
+USD_QUOTES = {"USD", "ZUSD"}
+
+GOOGLE_SHEETS_ENABLED = os.getenv("GOOGLE_SHEETS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+GOOGLE_SHEETS_SYNC_ON_RUN = os.getenv("GOOGLE_SHEETS_SYNC_ON_RUN", "true").strip().lower() in {"1", "true", "yes", "on"}
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+GOOGLE_SHEETS_SPREADSHEET_URL = os.getenv("GOOGLE_SHEETS_SPREADSHEET_URL", "").strip()
+GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv("GOOGLE_SHEETS_WORKSHEET_NAME", "Screener").strip() or "Screener"
+GOOGLE_SHEETS_VALUE_INPUT_OPTION = os.getenv("GOOGLE_SHEETS_VALUE_INPUT_OPTION", "RAW").strip().upper() or "RAW"
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+RUN_CONTINUOUSLY = os.getenv("RUN_CONTINUOUSLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+RUN_INTERVAL_SECONDS = max(float(os.getenv("RUN_INTERVAL_SECONDS", "300")), 15.0)
+RUN_ON_STARTUP = os.getenv("RUN_ON_STARTUP", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+
+class KrakenPublicClient:
+    def __init__(self) -> None:
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=40)
+        self.client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, limits=limits)
+        self._semaphore = None
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        return self._semaphore
+
+    async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        async with self.semaphore:
+            response = await self.client.get(f"{KRAKEN_BASE_URL}{endpoint}", params=params or {})
+            response.raise_for_status()
+            payload = response.json()
+            errors = payload.get("error", [])
+            if errors:
+                raise RuntimeError(f"Kraken API error for {endpoint}: {errors}")
+            return payload.get("result", {})
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    app.state.kraken = KrakenPublicClient()
+    app.state.latest_df = None
+    app.state.latest_generated_at = None
+    app.state.latest_run_seconds = None
+    app.state.latest_run_metadata = None
+    app.state.run_lock = asyncio.Lock()
+    app.state.scheduler_enabled = RUN_CONTINUOUSLY
+    app.state.scheduler_interval_seconds = RUN_INTERVAL_SECONDS
+    app.state.scheduler_iteration = 0
+    app.state.scheduler_last_started_at = None
+    app.state.scheduler_last_completed_at = None
+    app.state.scheduler_last_status = None
+    app.state.scheduler_last_error = None
+    app.state.scheduler_consecutive_failures = 0
+    app.state.scheduler_next_run_at = None
+    app.state.scheduler_task = None
+    if RUN_CONTINUOUSLY:
+        app.state.scheduler_task = asyncio.create_task(scheduler_loop(), name="kraken-screener-scheduler")
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    scheduler_task = getattr(app.state, "scheduler_task", None)
+    if scheduler_task is not None:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+    client = getattr(app.state, "kraken", None)
+    if client is not None:
+        await client.aclose()
+
+
+def env_whitelist_tokens() -> List[str]:
+    return [token.strip() for token in WHITELIST_RAW.split(",") if token.strip()]
+
+
+def parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def extract_google_sheet_id(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", candidate)
+    if match:
+        return match.group(1)
+    return candidate
+
+
+def sanitize_sheet_title(value: str) -> str:
+    title = (value or "Screener").strip() or "Screener"
+    title = re.sub(r"[\[\]\*\?/\\:]", "_", title)
+    return title[:100]
+
+
+def google_sheets_service_account_email() -> Optional[str]:
+    try:
+        if GOOGLE_SERVICE_ACCOUNT_JSON:
+            return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email")
+        if GOOGLE_SERVICE_ACCOUNT_JSON_B64:
+            decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
+            return json.loads(decoded).get("client_email")
+    except Exception:
+        return None
+    return None
+
+
+def load_google_sheets_credentials():
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        return service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SHEETS_SCOPES)
+    if GOOGLE_SERVICE_ACCOUNT_JSON_B64:
+        decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
+        info = json.loads(decoded)
+        return service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SHEETS_SCOPES)
+    credentials, _ = google.auth.default(scopes=GOOGLE_SHEETS_SCOPES)
+    return credentials
+
+
+def google_sheets_target_id() -> str:
+    spreadsheet_id = extract_google_sheet_id(GOOGLE_SHEETS_SPREADSHEET_ID)
+    if spreadsheet_id:
+        return spreadsheet_id
+    spreadsheet_id = extract_google_sheet_id(GOOGLE_SHEETS_SPREADSHEET_URL)
+    if spreadsheet_id:
+        return spreadsheet_id
+    return ""
+
+
+def google_sheets_configured() -> bool:
+    return GOOGLE_SHEETS_ENABLED and bool(google_sheets_target_id())
+
+
+def build_google_sheets_service():
+    credentials = load_google_sheets_credentials()
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+
+def dataframe_to_sheet_values(frame: pd.DataFrame) -> List[List[Any]]:
+    if frame is None or frame.empty:
+        return [list(frame.columns)] if frame is not None else [[]]
+
+    export_frame = frame.copy()
+    export_frame = export_frame.where(pd.notnull(export_frame), None)
+
+    values: List[List[Any]] = [list(export_frame.columns)]
+    for row in export_frame.itertuples(index=False, name=None):
+        converted_row: List[Any] = []
+        for value in row:
+            if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                converted_row.append("")
+            elif isinstance(value, (pd.Timestamp, datetime)):
+                converted_row.append(value.isoformat())
+            elif isinstance(value, (np.integer,)):
+                converted_row.append(int(value))
+            elif isinstance(value, (np.floating, float)):
+                converted_row.append(float(value))
+            elif isinstance(value, (np.bool_, bool)):
+                converted_row.append(bool(value))
+            elif isinstance(value, (dict, list, tuple)):
+                converted_row.append(json.dumps(value, default=str))
+            else:
+                converted_row.append(value)
+        values.append(converted_row)
+    return values
+
+
+def ensure_google_worksheet(service, spreadsheet_id: str, worksheet_name: str) -> None:
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheets = spreadsheet.get("sheets", [])
+    titles = {sheet.get("properties", {}).get("title") for sheet in sheets}
+    if worksheet_name in titles:
+        return
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": worksheet_name}}}]},
+    ).execute()
+
+
+def push_dataframe_to_google_sheet(frame: pd.DataFrame) -> Dict[str, Any]:
+    if frame is None:
+        raise ValueError("No dataframe is loaded yet.")
+
+    spreadsheet_id = google_sheets_target_id()
+    if not spreadsheet_id:
+        raise ValueError("Google Sheets is not configured: missing GOOGLE_SHEETS_SPREADSHEET_ID or GOOGLE_SHEETS_SPREADSHEET_URL.")
+
+    worksheet_name = sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME)
+    service = build_google_sheets_service()
+    ensure_google_worksheet(service, spreadsheet_id, worksheet_name)
+
+    spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id = None
+    for sheet in spreadsheet.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == worksheet_name:
+            sheet_id = props.get("sheetId")
+            break
+    if sheet_id is None:
+        raise ValueError(f"Unable to locate worksheet '{worksheet_name}' after creation.")
+
+    values = dataframe_to_sheet_values(frame)
+    range_name = f"'{worksheet_name}'!A1"
+    clear_range = f"'{worksheet_name}'"
+    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=clear_range).execute()
+    update_result = service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        valueInputOption=GOOGLE_SHEETS_VALUE_INPUT_OPTION,
+        body={"values": values},
+    ).execute()
+
+    column_count = max(len(frame.columns), 1)
+    row_count = max(len(frame) + 1, 1)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {"frozenRowCount": 1},
+                        },
+                        "fields": "gridProperties.frozenRowCount",
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat.bold",
+                    }
+                },
+                {
+                    "setBasicFilter": {
+                        "filter": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,
+                                "endRowIndex": row_count,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": column_count,
+                            }
+                        }
+                    }
+                },
+                {
+                    "autoResizeDimensions": {
+                        "dimensions": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 0,
+                            "endIndex": column_count,
+                        }
+                    }
+                },
+            ]
+        },
+    ).execute()
+
+    updated_cells = update_result.get("updatedCells")
+    return {
+        "enabled": True,
+        "spreadsheet_id": spreadsheet_id,
+        "worksheet_name": worksheet_name,
+        "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+        "updated_rows_including_header": len(values),
+        "updated_columns": column_count,
+        "updated_cells": updated_cells,
+        "service_account_email": google_sheets_service_account_email(),
+    }
+
+def to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+        return float(value)
+    try:
+        value = str(value).strip()
+        if value == "":
+            return None
+        parsed = float(value)
+        if math.isnan(parsed) or math.isinf(parsed):
+            return None
+        return parsed
+    except Exception:
+        return None
+
+
+def to_int(value: Any) -> Optional[int]:
+    parsed = to_float(value)
+    return None if parsed is None else int(parsed)
+
+
+def safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def last_value(series: Optional[pd.Series]) -> Optional[float]:
+    if series is None:
+        return None
+    cleaned = pd.to_numeric(series, errors="coerce").dropna()
+    if cleaned.empty:
+        return None
+    return float(cleaned.iloc[-1])
+
+
+def normalize_asset_code(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    text = value.upper().strip()
+    for prefix in ("X", "Z"):
+        if text.startswith(prefix) and len(text) > 3:
+            text = text[1:]
+    return text
+
+
+def normalize_pair_token(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return (
+        value.upper()
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(".", "")
+        .replace(" ", "")
+    )
+
+
+def is_usd_pair(pair_code: str, info: Dict[str, Any]) -> bool:
+    if pair_code.lower().endswith(".d"):
+        return False
+    altname = str(info.get("altname", ""))
+    wsname = str(info.get("wsname", ""))
+    if altname.lower().endswith(".d") or wsname.lower().endswith(".d"):
+        return False
+    status = str(info.get("status", "online") or "online").lower()
+    if status not in {"online", "post_only", "limit_only", "reduce_only"}:
+        return False
+    quote = normalize_asset_code(info.get("quote"))
+    if quote in USD_QUOTES:
+        return True
+    return wsname.endswith("/USD") or altname.endswith("USD")
+
+
+def whitelist_selected(pair_code: str, info: Dict[str, Any], whitelist_tokens: Iterable[str]) -> bool:
+    if not USE_WHITELIST:
+        return True
+    options = {
+        normalize_pair_token(pair_code),
+        normalize_pair_token(info.get("altname")),
+        normalize_pair_token(info.get("wsname")),
+    }
+    for token in whitelist_tokens:
+        if normalize_pair_token(token) in options:
+            return True
+    return False
+
+
+def wma(series: pd.Series, window: int) -> pd.Series:
+    weights = np.arange(1, window + 1, dtype=float)
+    return series.rolling(window).apply(lambda values: np.dot(values, weights) / weights.sum(), raw=True)
+
+
+def dema(series: pd.Series, window: int) -> pd.Series:
+    ema1 = series.ewm(span=window, adjust=False).mean()
+    ema2 = ema1.ewm(span=window, adjust=False).mean()
+    return 2 * ema1 - ema2
+
+
+def tema(series: pd.Series, window: int) -> pd.Series:
+    ema1 = series.ewm(span=window, adjust=False).mean()
+    ema2 = ema1.ewm(span=window, adjust=False).mean()
+    ema3 = ema2.ewm(span=window, adjust=False).mean()
+    return 3 * ema1 - 3 * ema2 + ema3
+
+
+def trima(series: pd.Series, window: int) -> pd.Series:
+    half = max(1, math.ceil(window / 2))
+    return series.rolling(half).mean().rolling(half).mean()
+
+
+def kama(series: pd.Series, window: int = 10, fast: int = 2, slow: int = 30) -> pd.Series:
+    close = pd.to_numeric(series, errors="coerce")
+    change = close.diff(window).abs()
+    volatility = close.diff().abs().rolling(window).sum()
+    efficiency_ratio = (change / volatility.replace(0, np.nan)).fillna(0.0)
+    fast_sc = 2.0 / (fast + 1.0)
+    slow_sc = 2.0 / (slow + 1.0)
+    smoothing_constant = (efficiency_ratio * (fast_sc - slow_sc) + slow_sc) ** 2
+
+    result = pd.Series(index=close.index, dtype=float)
+    if close.dropna().empty:
+        return result
+    first_valid = close.first_valid_index()
+    if first_valid is None:
+        return result
+    result.loc[first_valid] = close.loc[first_valid]
+
+    started = False
+    previous = None
+    for idx, price in close.items():
+        if pd.isna(price):
+            continue
+        if not started:
+            result.loc[idx] = price
+            previous = price
+            started = True
+            continue
+        sc = smoothing_constant.loc[idx]
+        if pd.isna(sc):
+            result.loc[idx] = previous
+        else:
+            previous = previous + sc * (price - previous)
+            result.loc[idx] = previous
+    return result
+
+
+def linear_regression_slope(series: pd.Series, window: int = 20) -> pd.Series:
+    def slope_fn(values: np.ndarray) -> float:
+        x = np.arange(len(values), dtype=float)
+        slope, _ = np.polyfit(x, values, 1)
+        return slope
+
+    return series.rolling(window).apply(slope_fn, raw=True)
+
+
+def cmo(series: pd.Series, window: int = 14) -> pd.Series:
+    diff = series.diff()
+    up = diff.clip(lower=0).rolling(window).sum()
+    down = (-diff.clip(upper=0)).rolling(window).sum()
+    return 100 * (up - down) / (up + down).replace(0, np.nan)
+
+
+def rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    gains = delta.clip(lower=0)
+    losses = (-delta.clip(upper=0))
+    avg_gain = gains.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    avg_loss = losses.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def macd_components(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd_line - macd_signal
+    return macd_line, macd_signal, macd_hist
+
+
+def ppo_components(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    ppo_line = (ema_fast - ema_slow) / ema_slow.replace(0, np.nan) * 100
+    ppo_signal = ppo_line.ewm(span=signal, adjust=False).mean()
+    ppo_hist = ppo_line - ppo_signal
+    return ppo_line, ppo_signal, ppo_hist
+
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr_components = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    )
+    return tr_components.max(axis=1)
+
+
+def realized_volatility(close: pd.Series, window: int = 20) -> pd.Series:
+    log_ret = np.log(close / close.shift(1))
+    return log_ret.rolling(window).std() * math.sqrt(window)
+
+
+def plus_minus_dm(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    return pd.Series(plus_dm, index=df.index), pd.Series(minus_dm, index=df.index)
+
+
+def parse_ohlc_rows(payload: Dict[str, Any]) -> pd.DataFrame:
+    pair_key = next((key for key in payload.keys() if key != "last"), None)
+    if pair_key is None:
+        return pd.DataFrame()
+    rows = payload.get(pair_key, []) or []
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(
+        rows,
+        columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"],
+    )
+    frame = frame.iloc[:-1] if len(frame) > 1 else frame
+    for col in ["open", "high", "low", "close", "vwap", "volume", "count"]:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+    frame = frame.dropna(subset=["open", "high", "low", "close", "volume"])
+    frame = frame.tail(OHLC_WINDOW_LIMIT).reset_index(drop=True)
+    return frame
+
+
+def parse_order_book(payload: Dict[str, Any]) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    pair_key = next(iter(payload.keys()), None)
+    if pair_key is None:
+        return [], []
+    book = payload.get(pair_key, {}) or {}
+    bids: List[Tuple[float, float]] = []
+    asks: List[Tuple[float, float]] = []
+
+    for side_name, dest in (("bids", bids), ("asks", asks)):
+        for row in book.get(side_name, []) or []:
+            price = to_float(row[0] if len(row) > 0 else None)
+            qty = to_float(row[1] if len(row) > 1 else None)
+            if price is not None and qty is not None:
+                dest.append((price, qty))
+    return bids, asks
+
+
+def parse_trades(payload: Dict[str, Any]) -> pd.DataFrame:
+    pair_key = next((key for key in payload.keys() if key != "last"), None)
+    if pair_key is None:
+        return pd.DataFrame(columns=["price", "volume", "time", "side", "ordertype", "misc"])
+    rows = payload.get(pair_key, []) or []
+    parsed = []
+    for row in rows:
+        parsed.append(
+            {
+                "price": to_float(row[0] if len(row) > 0 else None),
+                "volume": to_float(row[1] if len(row) > 1 else None),
+                "time": to_float(row[2] if len(row) > 2 else None),
+                "side": row[3] if len(row) > 3 else None,
+                "ordertype": row[4] if len(row) > 4 else None,
+                "misc": row[5] if len(row) > 5 else None,
+            }
+        )
+    frame = pd.DataFrame(parsed)
+    if frame.empty:
+        return frame
+    frame = frame.dropna(subset=["price", "volume", "time"])
+    frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+    frame = frame.sort_values("time").reset_index(drop=True)
+    return frame
+
+
+def parse_spreads(payload: Dict[str, Any]) -> pd.DataFrame:
+    pair_key = next((key for key in payload.keys() if key != "last"), None)
+    if pair_key is None:
+        return pd.DataFrame(columns=["time", "bid", "ask"])
+    rows = payload.get(pair_key, []) or []
+    parsed = []
+    for row in rows:
+        parsed.append(
+            {
+                "time": to_float(row[0] if len(row) > 0 else None),
+                "bid": to_float(row[1] if len(row) > 1 else None),
+                "ask": to_float(row[2] if len(row) > 2 else None),
+            }
+        )
+    frame = pd.DataFrame(parsed)
+    if frame.empty:
+        return frame
+    frame = frame.dropna(subset=["time", "bid", "ask"])
+    frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+    frame = frame.sort_values("time").reset_index(drop=True)
+    return frame
+
+
+def detect_candlestick_patterns(df: pd.DataFrame) -> Dict[str, int]:
+    defaults = {
+        "pattern_doji": 0,
+        "pattern_hammer": 0,
+        "pattern_engulfing": 0,
+        "pattern_morning_star": 0,
+        "pattern_evening_star": 0,
+        "pattern_three_black_crows": 0,
+        "pattern_marubozu": 0,
+        "pattern_harami": 0,
+        "pattern_piercing": 0,
+        "pattern_shooting_star": 0,
+    }
+    if len(df) < 3:
+        return defaults
+
+    c1 = df.iloc[-3]
+    c2 = df.iloc[-2]
+    c3 = df.iloc[-1]
+
+    def body(candle: pd.Series) -> float:
+        return abs(float(candle["close"]) - float(candle["open"]))
+
+    def candle_range(candle: pd.Series) -> float:
+        return max(float(candle["high"]) - float(candle["low"]), 1e-12)
+
+    def upper_shadow(candle: pd.Series) -> float:
+        return float(candle["high"]) - max(float(candle["open"]), float(candle["close"]))
+
+    def lower_shadow(candle: pd.Series) -> float:
+        return min(float(candle["open"]), float(candle["close"])) - float(candle["low"])
+
+    def bullish(candle: pd.Series) -> bool:
+        return float(candle["close"]) > float(candle["open"])
+
+    def bearish(candle: pd.Series) -> bool:
+        return float(candle["close"]) < float(candle["open"])
+
+    doji = body(c3) <= 0.1 * candle_range(c3)
+    hammer = lower_shadow(c3) >= 2 * max(body(c3), 1e-12) and upper_shadow(c3) <= body(c3)
+    shooting_star = upper_shadow(c3) >= 2 * max(body(c3), 1e-12) and lower_shadow(c3) <= body(c3)
+
+    engulfing = 0
+    if bullish(c2) and bearish(c3) and float(c3["open"]) >= float(c2["close"]) and float(c3["close"]) <= float(c2["open"]):
+        engulfing = -1
+    elif bearish(c2) and bullish(c3) and float(c3["open"]) <= float(c2["close"]) and float(c3["close"]) >= float(c2["open"]):
+        engulfing = 1
+
+    small_middle = body(c2) <= 0.5 * max(body(c1), 1e-12)
+    morning_star = int(bearish(c1) and small_middle and bullish(c3) and float(c3["close"]) > (float(c1["open"]) + float(c1["close"])) / 2)
+    evening_star = int(bullish(c1) and small_middle and bearish(c3) and float(c3["close"]) < (float(c1["open"]) + float(c1["close"])) / 2)
+
+    three_black_crows = int(bearish(c1) and bearish(c2) and bearish(c3) and float(c2["close"]) < float(c1["close"]) and float(c3["close"]) < float(c2["close"]))
+
+    marubozu = 0
+    if upper_shadow(c3) <= 0.05 * candle_range(c3) and lower_shadow(c3) <= 0.05 * candle_range(c3):
+        marubozu = 1 if bullish(c3) else -1 if bearish(c3) else 0
+
+    harami = 0
+    if bullish(c2) and bearish(c3) and max(float(c3["open"]), float(c3["close"])) <= float(c2["close"]) and min(float(c3["open"]), float(c3["close"])) >= float(c2["open"]):
+        harami = -1
+    elif bearish(c2) and bullish(c3) and max(float(c3["open"]), float(c3["close"])) <= float(c2["open"]) and min(float(c3["open"]), float(c3["close"])) >= float(c2["close"]):
+        harami = 1
+
+    piercing = int(
+        bearish(c2)
+        and bullish(c3)
+        and float(c3["open"]) < float(c2["low"])
+        and float(c3["close"]) > (float(c2["open"]) + float(c2["close"])) / 2
+        and float(c3["close"]) < float(c2["open"])
+    )
+
+    defaults.update(
+        {
+            "pattern_doji": int(doji),
+            "pattern_hammer": int(hammer),
+            "pattern_engulfing": engulfing,
+            "pattern_morning_star": morning_star,
+            "pattern_evening_star": evening_star,
+            "pattern_three_black_crows": three_black_crows,
+            "pattern_marubozu": marubozu,
+            "pattern_harami": harami,
+            "pattern_piercing": piercing,
+            "pattern_shooting_star": int(shooting_star),
+        }
+    )
+    return defaults
+
+
+def estimate_slippage(order_side: str, levels: List[Tuple[float, float]], mid_price: Optional[float], notional_usd: float) -> Tuple[Optional[float], Optional[float]]:
+    if mid_price is None or mid_price <= 0 or not levels:
+        return None, None
+
+    remaining = notional_usd
+    acquired_base = 0.0
+    spent_quote = 0.0
+
+    for price, qty in levels:
+        level_notional = price * qty
+        take_quote = min(remaining, level_notional)
+        take_base = take_quote / price
+        acquired_base += take_base
+        spent_quote += take_quote
+        remaining -= take_quote
+        if remaining <= 1e-9:
+            break
+
+    if spent_quote <= 0 or acquired_base <= 0:
+        return None, None
+
+    average_price = spent_quote / acquired_base
+    if order_side == "buy":
+        slippage_pct = ((average_price - mid_price) / mid_price) * 100
+    else:
+        slippage_pct = ((mid_price - average_price) / mid_price) * 100
+    return average_price, slippage_pct
+
+
+def depth_within_bps(levels: List[Tuple[float, float]], mid_price: Optional[float], bps: int, side: str) -> Optional[float]:
+    if mid_price is None or mid_price <= 0:
+        return None
+    threshold = mid_price * (1 - bps / 10000) if side == "bid" else mid_price * (1 + bps / 10000)
+    total_quote = 0.0
+    for price, qty in levels:
+        if side == "bid" and price >= threshold:
+            total_quote += price * qty
+        if side == "ask" and price <= threshold:
+            total_quote += price * qty
+    return total_quote
+
+
+def order_book_slope(levels: List[Tuple[float, float]], mid_price: Optional[float]) -> Optional[float]:
+    if mid_price is None or mid_price <= 0 or len(levels) < 3:
+        return None
+    distances = []
+    cumulative = []
+    running_quote = 0.0
+    for price, qty in levels:
+        running_quote += price * qty
+        distances.append(abs(price - mid_price) / mid_price * 10000)
+        cumulative.append(running_quote)
+    if len(set(distances)) < 2:
+        return None
+    slope, _ = np.polyfit(np.asarray(distances, dtype=float), np.asarray(cumulative, dtype=float), 1)
+    return float(slope)
+
+
+def burst_factor(trades: pd.DataFrame) -> Optional[float]:
+    if trades.empty:
+        return None
+    counts = trades.set_index("time").resample("1s").size()
+    counts = counts[counts >= 0]
+    if counts.empty or counts.mean() == 0:
+        return None
+    return float(counts.max() / counts.mean())
+
+
+def compute_trade_flow_metrics(trades: pd.DataFrame) -> Dict[str, Optional[float]]:
+    defaults: Dict[str, Optional[float]] = {
+        "trade_count_recent": 0.0,
+        "trade_window_seconds": None,
+        "trade_intensity_tps": None,
+        "avg_trade_size_base": None,
+        "avg_trade_size_quote": None,
+        "buy_trade_count": 0.0,
+        "sell_trade_count": 0.0,
+        "buy_volume_base": None,
+        "sell_volume_base": None,
+        "buy_sell_aggressor_ratio_count": None,
+        "buy_sell_aggressor_ratio_volume": None,
+        "signed_volume_base": None,
+        "aggressor_delta_base": None,
+        "order_flow_imbalance": None,
+        "trade_burst_factor": None,
+        "tick_volatility_50": None,
+        "effective_spread_pct": None,
+        "short_horizon_imbalance_signal": None,
+    }
+    if trades.empty:
+        return defaults
+
+    frame = trades.copy()
+    frame["side"] = frame["side"].astype(str)
+    frame["signed_volume"] = np.where(frame["side"] == "b", frame["volume"], -frame["volume"])
+    frame["quote_volume"] = frame["price"] * frame["volume"]
+
+    buy_mask = frame["side"] == "b"
+    sell_mask = frame["side"] == "s"
+    buy_count = int(buy_mask.sum())
+    sell_count = int(sell_mask.sum())
+    buy_volume = float(frame.loc[buy_mask, "volume"].sum())
+    sell_volume = float(frame.loc[sell_mask, "volume"].sum())
+    total_volume = float(frame["volume"].sum())
+
+    first_time = frame["time"].iloc[0]
+    last_time = frame["time"].iloc[-1]
+    window_seconds = max((last_time - first_time).total_seconds(), 1.0)
+
+    mid_price = float(frame["price"].iloc[-1])
+    effective_spread_pct = None
+    if len(frame) >= 2 and mid_price > 0:
+        effective_spread_pct = float(2 * abs(frame["price"].iloc[-1] - frame["price"].tail(20).median()) / mid_price * 100)
+
+    short_horizon = frame.tail(50)
+    short_horizon_signal = None
+    if not short_horizon.empty:
+        signed = float(short_horizon["signed_volume"].sum())
+        total = float(short_horizon["volume"].sum())
+        short_horizon_signal = signed / total if total > 0 else None
+
+    tick_volatility_50 = None
+    if len(frame) >= 3:
+        log_rets = np.log(frame["price"] / frame["price"].shift(1)).dropna().tail(50)
+        if not log_rets.empty:
+            tick_volatility_50 = float(log_rets.std())
+
+    defaults.update(
+        {
+            "trade_count_recent": float(len(frame)),
+            "trade_window_seconds": float(window_seconds),
+            "trade_intensity_tps": float(len(frame) / window_seconds),
+            "avg_trade_size_base": float(frame["volume"].mean()),
+            "avg_trade_size_quote": float(frame["quote_volume"].mean()),
+            "buy_trade_count": float(buy_count),
+            "sell_trade_count": float(sell_count),
+            "buy_volume_base": buy_volume,
+            "sell_volume_base": sell_volume,
+            "buy_sell_aggressor_ratio_count": safe_div(float(buy_count), float(sell_count) if sell_count else None),
+            "buy_sell_aggressor_ratio_volume": safe_div(buy_volume, sell_volume if sell_volume else None),
+            "signed_volume_base": float(frame["signed_volume"].sum()),
+            "aggressor_delta_base": buy_volume - sell_volume,
+            "order_flow_imbalance": safe_div(buy_volume - sell_volume, total_volume),
+            "trade_burst_factor": burst_factor(frame),
+            "tick_volatility_50": tick_volatility_50,
+            "effective_spread_pct": effective_spread_pct,
+            "short_horizon_imbalance_signal": short_horizon_signal,
+        }
+    )
+    return defaults
+
+
+def compute_spread_metrics(spreads: pd.DataFrame) -> Dict[str, Optional[float]]:
+    defaults = {
+        "spread_samples_recent": 0.0,
+        "spread_mean_recent": None,
+        "spread_median_recent": None,
+        "spread_std_recent": None,
+        "spread_pct_mean_recent": None,
+        "spread_pct_max_recent": None,
+    }
+    if spreads.empty:
+        return defaults
+
+    frame = spreads.copy()
+    frame["spread"] = frame["ask"] - frame["bid"]
+    frame["mid"] = (frame["ask"] + frame["bid"]) / 2.0
+    frame["spread_pct"] = np.where(frame["mid"] > 0, frame["spread"] / frame["mid"] * 100.0, np.nan)
+
+    defaults.update(
+        {
+            "spread_samples_recent": float(len(frame)),
+            "spread_mean_recent": float(frame["spread"].mean()),
+            "spread_median_recent": float(frame["spread"].median()),
+            "spread_std_recent": float(frame["spread"].std()) if len(frame) > 1 else 0.0,
+            "spread_pct_mean_recent": float(frame["spread_pct"].mean()),
+            "spread_pct_max_recent": float(frame["spread_pct"].max()),
+        }
+    )
+    return defaults
+
+
+def compute_depth_metrics(bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], mid_price: Optional[float]) -> Dict[str, Optional[float]]:
+    defaults = {
+        "best_bid_size": bids[0][1] if bids else None,
+        "best_ask_size": asks[0][1] if asks else None,
+        "bid_ask_size_ratio": None,
+        "quote_imbalance_best": None,
+        "cumulative_bid_depth_quote": None,
+        "cumulative_ask_depth_quote": None,
+        "depth_total_quote": None,
+        "depth_bid_5bps_quote": None,
+        "depth_ask_5bps_quote": None,
+        "depth_bid_10bps_quote": None,
+        "depth_ask_10bps_quote": None,
+        "depth_bid_25bps_quote": None,
+        "depth_ask_25bps_quote": None,
+        "order_book_imbalance_10bps": None,
+        "book_slope_bids": None,
+        "book_slope_asks": None,
+        "slippage_buy_1000_pct": None,
+        "slippage_sell_1000_pct": None,
+        "slippage_buy_5000_pct": None,
+        "slippage_sell_5000_pct": None,
+        "slippage_buy_10000_pct": None,
+        "slippage_sell_10000_pct": None,
+        "liquidity_score_simple": None,
+        "microprice": None,
+    }
+    if not bids or not asks or mid_price is None or mid_price <= 0:
+        return defaults
+
+    best_bid_size = bids[0][1]
+    best_ask_size = asks[0][1]
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    best_total = best_bid_size + best_ask_size
+    ratio = safe_div(best_bid_size, best_ask_size)
+    quote_imbalance_best = safe_div(best_bid_size - best_ask_size, best_total)
+    cumulative_bid = float(sum(price * qty for price, qty in bids))
+    cumulative_ask = float(sum(price * qty for price, qty in asks))
+
+    bid_10 = depth_within_bps(bids, mid_price, 10, "bid")
+    ask_10 = depth_within_bps(asks, mid_price, 10, "ask")
+    book_imbalance = None
+    if bid_10 is not None and ask_10 is not None:
+        book_imbalance = safe_div(bid_10 - ask_10, bid_10 + ask_10)
+
+    _, slip_buy_1k = estimate_slippage("buy", asks, mid_price, 1000)
+    _, slip_sell_1k = estimate_slippage("sell", bids, mid_price, 1000)
+    _, slip_buy_5k = estimate_slippage("buy", asks, mid_price, 5000)
+    _, slip_sell_5k = estimate_slippage("sell", bids, mid_price, 5000)
+    _, slip_buy_10k = estimate_slippage("buy", asks, mid_price, 10000)
+    _, slip_sell_10k = estimate_slippage("sell", bids, mid_price, 10000)
+
+    liquidity_score = None
+    if bid_10 is not None and ask_10 is not None:
+        total_near_mid = bid_10 + ask_10
+        raw_spread_pct = ((best_ask - best_bid) / mid_price) * 100 if mid_price > 0 else None
+        if raw_spread_pct is not None and raw_spread_pct > 0:
+            liquidity_score = total_near_mid / raw_spread_pct
+
+    microprice = ((best_ask * best_bid_size) + (best_bid * best_ask_size)) / best_total if best_total > 0 else None
+
+    defaults.update(
+        {
+            "best_bid_size": best_bid_size,
+            "best_ask_size": best_ask_size,
+            "bid_ask_size_ratio": ratio,
+            "quote_imbalance_best": quote_imbalance_best,
+            "cumulative_bid_depth_quote": cumulative_bid,
+            "cumulative_ask_depth_quote": cumulative_ask,
+            "depth_total_quote": cumulative_bid + cumulative_ask,
+            "depth_bid_5bps_quote": depth_within_bps(bids, mid_price, 5, "bid"),
+            "depth_ask_5bps_quote": depth_within_bps(asks, mid_price, 5, "ask"),
+            "depth_bid_10bps_quote": bid_10,
+            "depth_ask_10bps_quote": ask_10,
+            "depth_bid_25bps_quote": depth_within_bps(bids, mid_price, 25, "bid"),
+            "depth_ask_25bps_quote": depth_within_bps(asks, mid_price, 25, "ask"),
+            "order_book_imbalance_10bps": book_imbalance,
+            "book_slope_bids": order_book_slope(bids, mid_price),
+            "book_slope_asks": order_book_slope(asks, mid_price),
+            "slippage_buy_1000_pct": slip_buy_1k,
+            "slippage_sell_1000_pct": slip_sell_1k,
+            "slippage_buy_5000_pct": slip_buy_5k,
+            "slippage_sell_5000_pct": slip_sell_5k,
+            "slippage_buy_10000_pct": slip_buy_10k,
+            "slippage_sell_10000_pct": slip_sell_10k,
+            "liquidity_score_simple": liquidity_score,
+            "microprice": microprice,
+        }
+    )
+    return defaults
+
+
+def compute_custom_indicators(candles: pd.DataFrame) -> Dict[str, Optional[float]]:
+    close = candles["close"]
+    high = candles["high"]
+    low = candles["low"]
+    volume = candles["volume"]
+    trade_count = candles["count"]
+
+    sma_20 = close.rolling(20).mean()
+    sma_50 = close.rolling(50).mean()
+    ema_20 = close.ewm(span=20, adjust=False).mean()
+    ema_50 = close.ewm(span=50, adjust=False).mean()
+    wma_20 = wma(close, 20)
+    dema_20 = dema(close, 20)
+    tema_20 = tema(close, 20)
+    trima_20 = trima(close, 20)
+    kama_10 = kama(close, 10)
+    linreg_20 = linear_regression_slope(close, 20)
+    tr_series = true_range(candles)
+    realized_vol_20 = realized_volatility(close, 20)
+    plus_dm, minus_dm = plus_minus_dm(candles)
+    roc_12 = (close / close.shift(12) - 1.0) * 100.0
+    rocp_12 = close / close.shift(12) - 1.0
+    rocr_12 = close / close.shift(12)
+    momentum_10 = close - close.shift(10)
+    cmo_14 = cmo(close, 14)
+    rolling_high_20 = high.rolling(20).max()
+    rolling_low_20 = low.rolling(20).min()
+    vol_sma_20 = volume.rolling(20).mean()
+    vol_sma_50 = volume.rolling(50).mean()
+    rel_volume_20 = volume / vol_sma_20.replace(0, np.nan)
+    volume_zscore = (volume - volume.rolling(20).mean()) / volume.rolling(20).std().replace(0, np.nan)
+    trade_count_zscore = (trade_count - trade_count.rolling(20).mean()) / trade_count.rolling(20).std().replace(0, np.nan)
+
+    raw: Dict[str, Optional[float]] = {
+        "ma_sma_20": last_value(sma_20),
+        "ma_sma_50": last_value(sma_50),
+        "ma_ema_20": last_value(ema_20),
+        "ma_ema_50": last_value(ema_50),
+        "ma_wma_20": last_value(wma_20),
+        "ma_dema_20": last_value(dema_20),
+        "ma_tema_20": last_value(tema_20),
+        "ma_trima_20": last_value(trima_20),
+        "ma_kama_10": last_value(kama_10),
+        "ma_mama": None,
+        "ma_cross_sma20_gt_sma50": 1.0 if (last_value(sma_20) is not None and last_value(sma_50) is not None and last_value(sma_20) > last_value(sma_50)) else 0.0,
+        "ma_cross_ema20_gt_ema50": 1.0 if (last_value(ema_20) is not None and last_value(ema_50) is not None and last_value(ema_20) > last_value(ema_50)) else 0.0,
+        "price_vs_sma20_pct": safe_div(last_value(close) - last_value(sma_20) if last_value(close) is not None and last_value(sma_20) is not None else None, last_value(sma_20)) * 100 if last_value(sma_20) else None,
+        "price_vs_ema20_pct": safe_div(last_value(close) - last_value(ema_20) if last_value(close) is not None and last_value(ema_20) is not None else None, last_value(ema_20)) * 100 if last_value(ema_20) else None,
+        "rolling_high_20": last_value(rolling_high_20),
+        "rolling_low_20": last_value(rolling_low_20),
+        "linreg_slope_20": last_value(linreg_20),
+        "linreg_slope_20_pct_of_price": safe_div(last_value(linreg_20), last_value(close)) * 100 if last_value(close) else None,
+        "true_range": last_value(tr_series),
+        "natr_custom": safe_div(last_value(tr_series), last_value(close)) * 100 if last_value(close) else None,
+        "realized_candle_vol_20": last_value(realized_vol_20),
+        "roc_12": last_value(roc_12),
+        "rocp_12": last_value(rocp_12),
+        "rocr_12": last_value(rocr_12),
+        "momentum_10": last_value(momentum_10),
+        "cmo_14": last_value(cmo_14),
+        "plus_dm": last_value(plus_dm),
+        "minus_dm": last_value(minus_dm),
+        "volume_sma_20": last_value(vol_sma_20),
+        "volume_sma_50": last_value(vol_sma_50),
+        "relative_volume_20": last_value(rel_volume_20),
+        "volume_anomaly_zscore_20": last_value(volume_zscore),
+        "trade_count_anomaly_zscore_20": last_value(trade_count_zscore),
+    }
+
+    raw.update(detect_candlestick_patterns(candles))
+    return raw
+
+
+def extract_ta_values(candles: pd.DataFrame) -> Dict[str, Optional[float]]:
+    frame = candles.copy()
+    frame["open"] = pd.to_numeric(frame["open"], errors="coerce")
+    frame["high"] = pd.to_numeric(frame["high"], errors="coerce")
+    frame["low"] = pd.to_numeric(frame["low"], errors="coerce")
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
+
+    macd_line, macd_signal, macd_hist = macd_components(frame["close"])
+    ppo_line, ppo_signal, ppo_hist = ppo_components(frame["close"])
+    rsi_series = rsi(frame["close"])
+
+    if not TA_AVAILABLE:
+        return {
+            "ta_available": 0.0,
+            "ta_import_error": TA_IMPORT_ERROR,
+            "momentum_rsi": last_value(rsi_series),
+            "trend_macd": last_value(macd_line),
+            "trend_macd_signal": last_value(macd_signal),
+            "trend_macd_diff": last_value(macd_hist),
+            "momentum_ppo": last_value(ppo_line),
+            "momentum_ppo_signal": last_value(ppo_signal),
+            "momentum_ppo_hist": last_value(ppo_hist),
+        }
+
+    try:
+        ta_df = add_all_ta_features(frame.copy(), open="open", high="high", low="low", close="close", volume="volume", fillna=False)
+    except Exception as exc:
+        return {
+            "ta_available": 0.0,
+            "ta_import_error": str(exc),
+            "momentum_rsi": last_value(rsi_series),
+            "trend_macd": last_value(macd_line),
+            "trend_macd_signal": last_value(macd_signal),
+            "trend_macd_diff": last_value(macd_hist),
+            "momentum_ppo": last_value(ppo_line),
+            "momentum_ppo_signal": last_value(ppo_signal),
+            "momentum_ppo_hist": last_value(ppo_hist),
+        }
+
+    result = {
+        "ta_available": 1.0,
+        "momentum_rsi": last_value(ta_df.get("momentum_rsi")) or last_value(rsi_series),
+        "trend_macd": last_value(ta_df.get("trend_macd")) or last_value(macd_line),
+        "trend_macd_signal": last_value(ta_df.get("trend_macd_signal")) or last_value(macd_signal),
+        "trend_macd_diff": last_value(ta_df.get("trend_macd_diff")) or last_value(macd_hist),
+        "momentum_ppo": last_value(ta_df.get("momentum_ppo")) or last_value(ppo_line),
+        "momentum_ppo_signal": last_value(ta_df.get("momentum_ppo_signal")) or last_value(ppo_signal),
+        "momentum_ppo_hist": last_value(ta_df.get("momentum_ppo_hist")) or last_value(ppo_hist),
+        "momentum_roc": last_value(ta_df.get("momentum_roc")),
+        "trend_cci": last_value(ta_df.get("trend_cci")),
+        "momentum_wr": last_value(ta_df.get("momentum_wr")),
+        "momentum_stoch": last_value(ta_df.get("momentum_stoch")),
+        "momentum_stoch_signal": last_value(ta_df.get("momentum_stoch_signal")),
+        "momentum_stoch_rsi": last_value(ta_df.get("momentum_stoch_rsi")),
+        "momentum_stoch_rsi_k": last_value(ta_df.get("momentum_stoch_rsi_k")),
+        "momentum_stoch_rsi_d": last_value(ta_df.get("momentum_stoch_rsi_d")),
+        "trend_aroon_up": last_value(ta_df.get("trend_aroon_up")),
+        "trend_aroon_down": last_value(ta_df.get("trend_aroon_down")),
+        "trend_trix": last_value(ta_df.get("trend_trix")),
+        "momentum_uo": last_value(ta_df.get("momentum_uo")),
+        "volatility_atr": last_value(ta_df.get("volatility_atr")),
+        "volatility_bbm": last_value(ta_df.get("volatility_bbm")),
+        "volatility_bbh": last_value(ta_df.get("volatility_bbh")),
+        "volatility_bbl": last_value(ta_df.get("volatility_bbl")),
+        "volatility_bbw": last_value(ta_df.get("volatility_bbw")),
+        "volatility_kch": last_value(ta_df.get("volatility_kch")),
+        "volatility_kcl": last_value(ta_df.get("volatility_kcl")),
+        "volatility_kcw": last_value(ta_df.get("volatility_kcw")),
+        "volatility_squeeze_on": None,
+        "volume_obv": last_value(ta_df.get("volume_obv")),
+        "volume_mfi": last_value(ta_df.get("volume_mfi")),
+        "volume_adi": last_value(ta_df.get("volume_adi")),
+        "volume_cmf": last_value(ta_df.get("volume_cmf")),
+        "trend_adx": last_value(ta_df.get("trend_adx")),
+        "trend_adxr": None,
+        "trend_adx_pos": last_value(ta_df.get("trend_adx_pos")),
+        "trend_adx_neg": last_value(ta_df.get("trend_adx_neg")),
+    }
+
+    adi_series = ta_df.get("volume_adi")
+    if adi_series is not None:
+        result["volume_chaikin_oscillator"] = last_value(
+            adi_series.ewm(span=3, adjust=False).mean() - adi_series.ewm(span=10, adjust=False).mean()
+        )
+    else:
+        result["volume_chaikin_oscillator"] = None
+
+    adx_series = ta_df.get("trend_adx")
+    if adx_series is not None:
+        result["trend_adxr"] = safe_div(
+            float(adx_series.iloc[-1]) + float(adx_series.shift(14).iloc[-1]) if not pd.isna(adx_series.shift(14).iloc[-1]) else None,
+            2.0,
+        )
+
+    bbh = result.get("volatility_bbh")
+    bbl = result.get("volatility_bbl")
+    kch = result.get("volatility_kch")
+    kcl = result.get("volatility_kcl")
+    if None not in {bbh, bbl, kch, kcl}:
+        result["volatility_squeeze_on"] = 1.0 if (bbl > kcl and bbh < kch) else 0.0
+
+    return result
+
+
+def scheduler_snapshot() -> Dict[str, Any]:
+    return {
+        "enabled": bool(getattr(app.state, "scheduler_enabled", False)),
+        "interval_seconds": getattr(app.state, "scheduler_interval_seconds", RUN_INTERVAL_SECONDS),
+        "run_on_startup": RUN_ON_STARTUP,
+        "iteration": getattr(app.state, "scheduler_iteration", 0),
+        "is_running": bool(getattr(app.state, "run_lock", None) and app.state.run_lock.locked()),
+        "last_started_at": getattr(app.state, "scheduler_last_started_at", None),
+        "last_completed_at": getattr(app.state, "scheduler_last_completed_at", None),
+        "last_status": getattr(app.state, "scheduler_last_status", None),
+        "last_error": getattr(app.state, "scheduler_last_error", None),
+        "consecutive_failures": getattr(app.state, "scheduler_consecutive_failures", 0),
+        "next_run_at": getattr(app.state, "scheduler_next_run_at", None),
+    }
+
+
+async def execute_screen_run(
+    selected_pairs: Optional[List[str]] = None,
+    sync_sheet_override: Optional[bool] = None,
+    run_source: str = "manual",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    async with app.state.run_lock:
+        started_at = datetime.now(timezone.utc)
+        frame, metadata = await build_screener_dataframe(selected_pairs=selected_pairs)
+        metadata["run_source"] = run_source
+        metadata["run_started_at_utc"] = started_at.isoformat()
+        metadata["run_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+        app.state.latest_df = frame
+        app.state.latest_generated_at = metadata["generated_at_utc"]
+        app.state.latest_run_seconds = metadata["elapsed_seconds"]
+        app.state.latest_run_metadata = metadata
+
+        should_sync_sheet = GOOGLE_SHEETS_SYNC_ON_RUN if sync_sheet_override is None else bool(sync_sheet_override)
+        if should_sync_sheet:
+            if google_sheets_configured():
+                try:
+                    metadata["google_sheets_sync"] = await asyncio.to_thread(push_dataframe_to_google_sheet, frame)
+                except Exception as exc:
+                    metadata["google_sheets_sync"] = {"enabled": True, "status": "error", "error": str(exc)}
+            else:
+                metadata["google_sheets_sync"] = {
+                    "enabled": GOOGLE_SHEETS_ENABLED,
+                    "status": "skipped",
+                    "reason": "Google Sheets is not fully configured.",
+                    "spreadsheet_id": google_sheets_target_id() or None,
+                    "worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+                    "service_account_email": google_sheets_service_account_email(),
+                }
+        return frame, metadata
+
+
+async def scheduler_loop() -> None:
+    first_cycle = True
+    while True:
+        try:
+            if first_cycle and not RUN_ON_STARTUP:
+                next_run_at = datetime.now(timezone.utc).timestamp() + RUN_INTERVAL_SECONDS
+                app.state.scheduler_next_run_at = datetime.fromtimestamp(next_run_at, tz=timezone.utc).isoformat()
+                await asyncio.sleep(RUN_INTERVAL_SECONDS)
+
+            app.state.scheduler_iteration += 1
+            app.state.scheduler_last_started_at = datetime.now(timezone.utc).isoformat()
+            app.state.scheduler_last_status = "running"
+            app.state.scheduler_last_error = None
+            app.state.scheduler_next_run_at = None
+
+            try:
+                await execute_screen_run(run_source="scheduler")
+                app.state.scheduler_last_status = "ok"
+                app.state.scheduler_consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                app.state.scheduler_last_status = "error"
+                app.state.scheduler_last_error = str(exc)
+                app.state.scheduler_consecutive_failures += 1
+
+            app.state.scheduler_last_completed_at = datetime.now(timezone.utc).isoformat()
+            next_run_at = datetime.now(timezone.utc).timestamp() + RUN_INTERVAL_SECONDS
+            app.state.scheduler_next_run_at = datetime.fromtimestamp(next_run_at, tz=timezone.utc).isoformat()
+            first_cycle = False
+            await asyncio.sleep(RUN_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            app.state.scheduler_last_status = "cancelled"
+            raise
+
+
+
+async def fetch_pair_bundle(kraken: KrakenPublicClient, pair_code: str) -> Dict[str, Any]:
+    ohlc_task = kraken.get("/OHLC", {"pair": pair_code, "interval": OHLC_INTERVAL})
+    depth_task = kraken.get("/Depth", {"pair": pair_code, "count": ORDER_BOOK_COUNT})
+    trades_task = kraken.get("/Trades", {"pair": pair_code})
+    spread_task = kraken.get("/Spread", {"pair": pair_code})
+    ohlc, depth, trades, spreads = await asyncio.gather(ohlc_task, depth_task, trades_task, spread_task)
+    return {
+        "ohlc": parse_ohlc_rows(ohlc),
+        "depth": parse_order_book(depth),
+        "trades": parse_trades(trades),
+        "spreads": parse_spreads(spreads),
+    }
+
+
+async def build_screener_dataframe(selected_pairs: Optional[List[str]] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    kraken: KrakenPublicClient = app.state.kraken
+    started = time.perf_counter()
+
+    assets_result, asset_pairs_result, tickers_result = await asyncio.gather(
+        kraken.get("/Assets"),
+        kraken.get("/AssetPairs"),
+        kraken.get("/Ticker"),
+    )
+
+    assets = assets_result or {}
+    asset_pairs = asset_pairs_result or {}
+    tickers = tickers_result or {}
+
+    whitelist_tokens = selected_pairs if selected_pairs is not None else env_whitelist_tokens()
+
+    selected: List[Tuple[str, Dict[str, Any]]] = []
+    for pair_code, info in asset_pairs.items():
+        if is_usd_pair(pair_code, info) and whitelist_selected(pair_code, info, whitelist_tokens):
+            selected.append((pair_code, info))
+    selected.sort(key=lambda item: str(item[1].get("wsname") or item[1].get("altname") or item[0]))
+
+    rows: List[Dict[str, Any]] = []
+
+    tasks = [fetch_pair_bundle(kraken, pair_code) for pair_code, _ in selected]
+    bundles = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for (pair_code, info), bundle in zip(selected, bundles):
+        if isinstance(bundle, Exception):
+            rows.append(
+                {
+                    "pair_code": pair_code,
+                    "altname": info.get("altname"),
+                    "wsname": info.get("wsname"),
+                    "status": info.get("status"),
+                    "screen_status": "error",
+                    "screen_error": str(bundle),
+                }
+            )
+            continue
+
+        candles: pd.DataFrame = bundle["ohlc"]
+        bids, asks = bundle["depth"]
+        trades: pd.DataFrame = bundle["trades"]
+        spreads: pd.DataFrame = bundle["spreads"]
+
+        if candles.empty or len(candles) < MIN_CANDLES_REQUIRED:
+            rows.append(
+                {
+                    "pair_code": pair_code,
+                    "altname": info.get("altname"),
+                    "wsname": info.get("wsname"),
+                    "status": info.get("status"),
+                    "screen_status": "insufficient_candles",
+                    "candle_count": int(len(candles)),
+                }
+            )
+            continue
+
+        ticker = tickers.get(pair_code) or tickers.get(info.get("altname")) or {}
+        base_code = info.get("base")
+        quote_code = info.get("quote")
+        base_asset = assets.get(base_code, {}) if base_code in assets else {}
+        quote_asset = assets.get(quote_code, {}) if quote_code in assets else {}
+
+        best_ask = to_float((ticker.get("a") or [None])[0])
+        best_bid = to_float((ticker.get("b") or [None])[0])
+        last_trade = to_float((ticker.get("c") or [None])[0])
+        last_trade_volume = to_float((ticker.get("c") or [None, None])[1])
+        volume_today = to_float((ticker.get("v") or [None])[0])
+        volume_24h = to_float((ticker.get("v") or [None, None])[1])
+        vwap_today = to_float((ticker.get("p") or [None])[0])
+        vwap_24h = to_float((ticker.get("p") or [None, None])[1])
+        trades_today = to_int((ticker.get("t") or [None])[0])
+        trades_24h = to_int((ticker.get("t") or [None, None])[1])
+        low_today = to_float((ticker.get("l") or [None])[0])
+        low_24h = to_float((ticker.get("l") or [None, None])[1])
+        high_today = to_float((ticker.get("h") or [None])[0])
+        high_24h = to_float((ticker.get("h") or [None, None])[1])
+        open_today = to_float(ticker.get("o"))
+
+        midpoint = None
+        if best_bid is not None and best_ask is not None:
+            midpoint = (best_bid + best_ask) / 2.0
+        elif last_trade is not None:
+            midpoint = last_trade
+
+        raw_spread = (best_ask - best_bid) if best_ask is not None and best_bid is not None else None
+        spread_pct = safe_div(raw_spread, midpoint) * 100 if midpoint else None
+
+        base_row: Dict[str, Any] = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "pair_code": pair_code,
+            "altname": info.get("altname"),
+            "wsname": info.get("wsname"),
+            "base_code": base_code,
+            "quote_code": quote_code,
+            "base_display": base_asset.get("altname") or normalize_asset_code(base_code),
+            "quote_display": quote_asset.get("altname") or normalize_asset_code(quote_code),
+            "pair_status": info.get("status"),
+            "pair_decimals": to_int(info.get("pair_decimals")),
+            "lot_decimals": to_int(info.get("lot_decimals")),
+            "tick_size": to_float(info.get("tick_size")),
+            "ordermin": to_float(info.get("ordermin")),
+            "costmin": to_float(info.get("costmin")),
+            "leverage_buy_max": max([to_float(x) or 0 for x in (info.get("leverage_buy") or [])], default=0),
+            "leverage_sell_max": max([to_float(x) or 0 for x in (info.get("leverage_sell") or [])], default=0),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "last_trade_price": last_trade,
+            "last_trade_volume": last_trade_volume,
+            "midpoint": midpoint,
+            "raw_spread": raw_spread,
+            "spread_pct": spread_pct,
+            "open_today": open_today,
+            "high_today": high_today,
+            "high_24h": high_24h,
+            "low_today": low_today,
+            "low_24h": low_24h,
+            "volume_today": volume_today,
+            "volume_24h": volume_24h,
+            "vwap_today": vwap_today,
+            "vwap_24h": vwap_24h,
+            "trades_today": trades_today,
+            "trades_24h": trades_24h,
+            "ohlc_interval_minutes": OHLC_INTERVAL,
+            "candle_count": int(len(candles)),
+            "last_candle_time": candles["time"].iloc[-1].isoformat(),
+            "screen_status": "ok",
+            "screen_error": None,
+        }
+
+        base_row.update(compute_custom_indicators(candles))
+        base_row.update(extract_ta_values(candles))
+        base_row.update(compute_spread_metrics(spreads))
+        base_row.update(compute_trade_flow_metrics(trades))
+        base_row.update(compute_depth_metrics(bids, asks, midpoint))
+
+        flow = base_row.get("short_horizon_imbalance_signal")
+        book = base_row.get("order_book_imbalance_10bps")
+        if flow is not None and book is not None:
+            base_row["short_horizon_imbalance_signal_combined"] = 0.5 * flow + 0.5 * book
+        else:
+            base_row["short_horizon_imbalance_signal_combined"] = flow if flow is not None else book
+
+        rows.append(base_row)
+
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        sort_cols = [col for col in ["volume_24h", "trade_count_recent"] if col in frame.columns]
+        if sort_cols:
+            frame = frame.sort_values(sort_cols, ascending=False, na_position="last").reset_index(drop=True)
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(OUTPUT_PATH, index=False)
+    elapsed = time.perf_counter() - started
+    metadata = {
+        "pair_count": int(len(frame)),
+        "csv_path": str(OUTPUT_PATH),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(elapsed, 3),
+        "use_whitelist": USE_WHITELIST,
+        "whitelist": whitelist_tokens,
+        "ta_available": TA_AVAILABLE,
+        "ta_import_error": TA_IMPORT_ERROR,
+        "google_sheets_enabled": GOOGLE_SHEETS_ENABLED,
+        "google_sheets_sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+        "google_sheets_configured": google_sheets_configured(),
+        "google_sheets_spreadsheet_id": google_sheets_target_id() or None,
+        "google_sheets_worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+        "google_sheets_service_account_email": google_sheets_service_account_email(),
+        "run_continuously": RUN_CONTINUOUSLY,
+        "run_interval_seconds": RUN_INTERVAL_SECONDS,
+        "run_on_startup": RUN_ON_STARTUP,
+    }
+    return frame, metadata
+
+
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    return {
+        "service": "kraken-usd-screener",
+        "status": "ok",
+        "endpoints": ["/health", "/pairs", "/run", "/preview", "/download/latest.csv", "/sheet/status", "/sheet/push", "/scheduler/status"],
+        "defaults": {
+            "quote_filter": "USD",
+            "use_whitelist": USE_WHITELIST,
+            "ohlc_interval_minutes": OHLC_INTERVAL,
+            "order_book_count": ORDER_BOOK_COUNT,
+            "output_path": str(OUTPUT_PATH),
+            "google_sheets_enabled": GOOGLE_SHEETS_ENABLED,
+            "google_sheets_sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+            "google_sheets_spreadsheet_id": google_sheets_target_id() or None,
+            "google_sheets_worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+            "google_sheets_service_account_email": google_sheets_service_account_email(),
+            "run_continuously": RUN_CONTINUOUSLY,
+            "run_interval_seconds": RUN_INTERVAL_SECONDS,
+            "run_on_startup": RUN_ON_STARTUP,
+        },
+        "scheduler": scheduler_snapshot(),
+    }
+
+
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "ta_available": TA_AVAILABLE,
+        "ta_import_error": TA_IMPORT_ERROR,
+        "latest_generated_at": app.state.latest_generated_at,
+        "output_exists": OUTPUT_PATH.exists(),
+        "google_sheets_enabled": GOOGLE_SHEETS_ENABLED,
+        "google_sheets_sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+        "google_sheets_configured": google_sheets_configured(),
+        "google_sheets_spreadsheet_id": google_sheets_target_id() or None,
+        "google_sheets_worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+        "google_sheets_service_account_email": google_sheets_service_account_email(),
+        "run_continuously": RUN_CONTINUOUSLY,
+        "run_interval_seconds": RUN_INTERVAL_SECONDS,
+        "run_on_startup": RUN_ON_STARTUP,
+        "scheduler": scheduler_snapshot(),
+        "latest_run_metadata": app.state.latest_run_metadata,
+    }
+
+
+@app.get("/pairs")
+async def pairs() -> Dict[str, Any]:
+    kraken: KrakenPublicClient = app.state.kraken
+    asset_pairs = await kraken.get("/AssetPairs")
+    whitelist_tokens = env_whitelist_tokens()
+    selected = []
+    for pair_code, info in asset_pairs.items():
+        if is_usd_pair(pair_code, info) and whitelist_selected(pair_code, info, whitelist_tokens):
+            selected.append(
+                {
+                    "pair_code": pair_code,
+                    "altname": info.get("altname"),
+                    "wsname": info.get("wsname"),
+                    "status": info.get("status"),
+                    "base": info.get("base"),
+                    "quote": info.get("quote"),
+                }
+            )
+    selected.sort(key=lambda item: str(item.get("wsname") or item.get("altname") or item["pair_code"]))
+    return {
+        "count": len(selected),
+        "use_whitelist": USE_WHITELIST,
+        "whitelist": whitelist_tokens,
+        "pairs": selected,
+    }
+
+
+@app.get("/sheet/status")
+async def sheet_status() -> Dict[str, Any]:
+    return {
+        "enabled": GOOGLE_SHEETS_ENABLED,
+        "sync_on_run": GOOGLE_SHEETS_SYNC_ON_RUN,
+        "configured": google_sheets_configured(),
+        "spreadsheet_id": google_sheets_target_id() or None,
+        "worksheet_name": sanitize_sheet_title(GOOGLE_SHEETS_WORKSHEET_NAME),
+        "service_account_email": google_sheets_service_account_email(),
+        "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{google_sheets_target_id()}/edit" if google_sheets_target_id() else None,
+    }
+
+
+@app.get("/scheduler/status")
+async def scheduler_status() -> Dict[str, Any]:
+    return scheduler_snapshot()
+
+
+
+@app.get("/run")
+async def run_screener(
+    whitelist: Optional[str] = Query(default=None, description="Comma-separated pair list to override the env whitelist for this run."),
+    preview_rows: int = Query(default=10, ge=1, le=100),
+    sync_sheet: Optional[bool] = Query(default=None, description="Override the default behavior and push the latest screener results into Google Sheets."),
+) -> JSONResponse:
+    selected_pairs = None
+    if whitelist:
+        selected_pairs = [token.strip() for token in whitelist.split(",") if token.strip()]
+
+    frame, metadata = await execute_screen_run(
+        selected_pairs=selected_pairs,
+        sync_sheet_override=sync_sheet,
+        run_source="manual",
+    )
+
+    preview = [] if frame.empty else frame.head(preview_rows).replace({np.nan: None}).to_dict(orient="records")
+    return JSONResponse({"metadata": metadata, "preview": preview})
+
+
+@app.get("/sheet/push")
+async def push_latest_to_sheet() -> JSONResponse:
+    if app.state.latest_df is None:
+        if not OUTPUT_PATH.exists():
+            raise HTTPException(status_code=404, detail="No screener output exists yet. Run /run first.")
+        app.state.latest_df = pd.read_csv(OUTPUT_PATH)
+
+    if not google_sheets_configured():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Sheets is not fully configured. Set GOOGLE_SHEETS_ENABLED=true, provide "
+                "GOOGLE_SHEETS_SPREADSHEET_ID or GOOGLE_SHEETS_SPREADSHEET_URL, and attach valid Google credentials."
+            ),
+        )
+
+    try:
+        result = await asyncio.to_thread(push_dataframe_to_google_sheet, app.state.latest_df)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to push screener results to Google Sheets: {exc}") from exc
+
+    return JSONResponse({"sheet_sync": result})
+
+
+@app.get("/preview")
+async def preview(rows: int = Query(default=20, ge=1, le=200)) -> JSONResponse:
+    if app.state.latest_df is None:
+        if not OUTPUT_PATH.exists():
+            raise HTTPException(status_code=404, detail="No screener output exists yet. Run /run first.")
+        app.state.latest_df = pd.read_csv(OUTPUT_PATH)
+    frame = app.state.latest_df.head(rows).replace({np.nan: None})
+    return JSONResponse({"rows": frame.to_dict(orient="records")})
+
+
+@app.get("/download/latest.csv")
+async def download_latest_csv() -> FileResponse:
+    if not OUTPUT_PATH.exists():
+        raise HTTPException(status_code=404, detail="No screener CSV exists yet. Run /run first.")
+    return FileResponse(path=str(OUTPUT_PATH), media_type="text/csv", filename="kraken_usd_screener_latest.csv")
